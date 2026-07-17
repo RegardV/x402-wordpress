@@ -67,6 +67,10 @@ php composer.phar install
 
 The protocol classes (`includes/`) are WordPress-free and tested against real captured challenges and signed payments. Conformance testing uses a real paying client against the live testnet facilitator.
 
+## Build log
+
+There is no PHP SDK for x402 — the challenge/receipt wire format, the facilitator client, and Coinbase's EdDSA-JWT mainnet auth were all rebuilt from scratch by reverse-engineering the reference TypeScript SDKs. **[BUILDLOG.md](BUILDLOG.md)** is the honest record: what we had to reinvent, the undocumented traps that cost real time (an SDK header rename, a proxy that paid to call itself, a sanitizer that un-sanitized itself, a route that sold your drafts), and how a real-paying-client conformance harness caught each one before production. Worth reading if you're integrating x402 into any non-JavaScript stack.
+
 ## License
 
 GPL-2.0-or-later

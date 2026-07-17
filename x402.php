@@ -22,7 +22,10 @@ require_once __DIR__ . '/includes/class-address.php';
 require_once __DIR__ . '/includes/class-chunker.php';
 require_once __DIR__ . '/includes/class-sanitizer.php';
 require_once __DIR__ . '/includes/class-search.php';
+require_once __DIR__ . '/includes/class-cdp-jwt.php';
+require_once __DIR__ . '/includes/class-crypto.php';
 require_once __DIR__ . '/includes/indexer.php';
+require_once __DIR__ . '/includes/products.php';
 require_once __DIR__ . '/includes/admin-page.php';
 
 use X402\Challenge;
@@ -49,8 +52,8 @@ function x402_demo_product(): array
         'description'  => 'x402 for WordPress demo product — a sample markdown file sold over the x402 protocol.',
         'mime_type'    => 'text/markdown',
         'amount_micro' => Price::toMicro('$0.01'),
-        'network'      => get_option('x402_network', 'eip155:84532'),
-        'pay_to'       => (string) get_option('x402_pay_to', ''),
+        'network'      => x402_active_network(),
+        'pay_to'       => x402_pay_to(),
         'file'         => __DIR__ . '/sample-content.md',
     ];
 }
@@ -63,8 +66,8 @@ function x402_ask_product(): array
         'description'  => (string) get_option('x402_ask_description', 'Paid retrieval over this site\'s indexed content. POST {"query": "..."} and get cited passages.'),
         'mime_type'    => 'application/json',
         'amount_micro' => Price::toMicro((string) get_option('x402_ask_price', '$0.02')),
-        'network'      => get_option('x402_network', 'eip155:84532'),
-        'pay_to'       => (string) get_option('x402_pay_to', ''),
+        'network'      => x402_active_network(),
+        'pay_to'       => x402_pay_to(),
     ];
 }
 
@@ -129,8 +132,23 @@ function x402_rate_limit(string $bucket, int $limit, int $window_seconds): bool
     return $count <= $limit;
 }
 
+/** Funnel log: one row per outcome (unpaid_402/paid_200/free_200/error). */
+function x402_log_request(string $product_ref, string $outcome): void
+{
+    global $wpdb;
+    $wpdb->insert($wpdb->prefix . 'x402_requests', [
+        'product_ref' => substr($product_ref, 0, 191),
+        'outcome'     => $outcome,
+        'ip_hash'     => x402_client_ip_hash(),
+        'created_at'  => gmdate('Y-m-d H:i:s'),
+    ]);
+}
+
 /**
  * The payment wall: 402 challenge → verify → settle → ledger → $deliver($settled).
+ * Before charging, an unpaid request from a source that already paid for this
+ * product within the redelivery window is delivered free (facilitator rejects
+ * replayed payments, so a failed download must be re-served here, not re-paid).
  * $deliver returns the WP_REST_Response for the buyer (or emits raw bytes and exits).
  */
 function x402_paywall(array $product, WP_REST_Request $request, callable $deliver)
@@ -140,10 +158,21 @@ function x402_paywall(array $product, WP_REST_Request $request, callable $delive
         return new WP_REST_Response(['error' => 'x402 receive wallet not configured'], 503);
     }
 
+    global $wpdb;
+    $settlements = new Settlements($wpdb);
+    $ip_hash     = x402_client_ip_hash();
+
     $payment = Facilitator::decode_payment(
         $request->get_header('payment-signature') ?? $request->get_header('x-payment')
     );
     if ($payment === null) {
+        $window = (int) get_option('x402_redelivery_minutes', 60);
+        if ($window > 0 && $settlements->find_redelivery_grant($product['sku'], $ip_hash, $window)) {
+            x402_log_request($product['sku'], 'free_200');
+            header('x-redelivery: 1');
+            return $deliver(['ok' => true, 'tx' => '', 'payer' => '', 'network' => $product['network']]);
+        }
+        x402_log_request($product['sku'], 'unpaid_402');
         return x402_402_response($product);
     }
 
@@ -156,30 +185,46 @@ function x402_paywall(array $product, WP_REST_Request $request, callable $delive
     ignore_user_abort(true);
 
     $requirements = Challenge::build($product)['accepts'][0];
-    $facilitator  = new Facilitator(X402_TESTNET_FACILITATOR);
+    $facilitator  = x402_facilitator();
 
     $verified = $facilitator->verify($payment, $requirements);
     if (!$verified['ok']) {
         error_log('[x402] verify failed (' . $product['sku'] . '): ' . $verified['error']);
+        x402_log_request($product['sku'], 'error');
         return x402_402_response($product);
     }
 
     $settled = $facilitator->settle($payment, $requirements);
     if (!$settled['ok']) {
         error_log('[x402] settle failed (' . $product['sku'] . '): ' . $settled['error']);
+        x402_log_request($product['sku'], 'error');
         return x402_402_response($product);
     }
 
     // Duplicate tx = redelivery of an already-paid purchase, never a recharge.
     if ($settled['tx'] !== '') {
-        global $wpdb;
-        (new Settlements($wpdb))->record_once($product['sku'], $product['amount_micro'], $settled);
+        $settlements->record_once($product['sku'], $product['amount_micro'], $settled, $ip_hash);
     } else {
         error_log('[x402] settled without transaction hash — ledger row skipped: ' . (string) json_encode($settled['raw']));
     }
 
+    x402_log_request($product['sku'], 'paid_200');
     return $deliver($settled);
 }
+
+/** 30-day retention on the funnel log. */
+add_action('x402_daily', function (): void {
+    global $wpdb;
+    $wpdb->query($wpdb->prepare(
+        "DELETE FROM {$wpdb->prefix}x402_requests WHERE created_at < %s",
+        gmdate('Y-m-d H:i:s', time() - 30 * DAY_IN_SECONDS)
+    ));
+});
+add_action('init', function (): void {
+    if (!wp_next_scheduled('x402_daily')) {
+        wp_schedule_event(time() + HOUR_IN_SECONDS, 'daily', 'x402_daily');
+    }
+});
 
 /** Raw-bytes delivery outside the REST JSON pipeline (files, proxied upstreams). */
 function x402_emit_raw(array $settled, int $status, string $content_type, string $bytes): void
@@ -213,6 +258,13 @@ add_action('rest_api_init', function (): void {
                     'sku' => 'ask', 'title' => 'Ask this site (per query)', 'price' => (string) get_option('x402_ask_price', '$0.02'),
                     'url' => rest_url('x402/v1/ask'), 'method' => 'POST', 'mimeType' => 'application/json', 'network' => $network,
                     'description' => x402_ask_product()['description'],
+                ];
+            }
+            foreach (x402_all_item_products() as $p) {
+                $products[] = [
+                    'sku' => $p['sku'], 'title' => $p['title'], 'price' => $p['price'],
+                    'url' => $p['url'], 'mimeType' => $p['mime_type'], 'network' => $network,
+                    'description' => $p['description'],
                 ];
             }
             foreach (x402_proxy_products() as $p) {
@@ -325,8 +377,8 @@ add_action('rest_api_init', function (): void {
                 'description'  => $match['title'],
                 'mime_type'    => '',
                 'amount_micro' => Price::toMicro($match['price']),
-                'network'      => get_option('x402_network', 'eip155:84532'),
-                'pay_to'       => (string) get_option('x402_pay_to', ''),
+                'network'      => x402_active_network(),
+                'pay_to'       => x402_pay_to(),
             ];
             return x402_paywall($product, $request, function (array $settled) use ($match, $request) {
                 $args = [
@@ -366,4 +418,91 @@ add_action('rest_api_init', function (): void {
             });
         },
     ]);
+
+    register_rest_route('x402/v1', '/i/(?P<id>\d+)', [
+        'methods'             => 'GET',
+        'permission_callback' => '__return_true',
+        'callback'            => function (WP_REST_Request $request) {
+            x402_no_store();
+            if (!x402_rate_limit(x402_client_ip_hash(), 60, 60)) {
+                return new WP_REST_Response(['error' => 'rate limit exceeded'], 429);
+            }
+            $product = x402_item_product((int) $request['id']);
+            if ($product === null) {
+                return new WP_REST_Response(['error' => 'not for sale'], 404);
+            }
+            // Browser visitor with no payment → themed hint, not a raw 402 JSON blob.
+            $accept  = (string) $request->get_header('accept');
+            $unpaid  = Facilitator::decode_payment($request->get_header('payment-signature') ?? $request->get_header('x-payment')) === null;
+            if ($unpaid && str_contains($accept, 'text/html')) {
+                x402_log_request($product['sku'], 'unpaid_402');
+                return x402_browser_hint($product);
+            }
+            if ($product['file'] !== null && !is_readable($product['file'])) {
+                error_log('[x402] attachment file missing: ' . (string) $product['file']);
+                return new WP_REST_Response(['error' => 'product unavailable'], 503);
+            }
+            return x402_paywall($product, $request, function (array $settled) use ($product): void {
+                if ($product['file'] !== null) {
+                    x402_emit_raw($settled, 200, $product['mime_type'], (string) file_get_contents($product['file']));
+                }
+                $html = apply_filters('the_content', get_post_field('post_content', $product['post_id']));
+                x402_emit_raw($settled, 200, 'text/html; charset=utf-8', (string) $html);
+            });
+        },
+    ]);
+});
+
+/** Themed page telling a human what this URL is (agents get the raw 402 instead). */
+function x402_browser_hint(array $product): WP_REST_Response
+{
+    $price = '$' . number_format($product['amount_micro'] / 1_000_000, 2);
+    $url   = esc_url($product['url']);
+    $body  = '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+        . '<title>' . esc_html($product['title']) . ' — pay with x402</title>'
+        . '<div style="max-width:38rem;margin:4rem auto;padding:0 1rem;font-family:system-ui,sans-serif;line-height:1.5">'
+        . '<h1>' . esc_html($product['title']) . '</h1>'
+        . '<p>' . esc_html($product['description']) . '</p>'
+        . '<p>This resource is sold to AI agents over the <a href="https://x402.org">x402</a> payment protocol for <strong>' . esc_html($price) . '</strong> in USDC.</p>'
+        . '<p>An x402-capable client pays automatically. To fetch it yourself:</p>'
+        . '<pre style="background:#f4f4f5;padding:1rem;border-radius:.5rem;overflow:auto"><code>curl -sD - ' . $url . '</code></pre>'
+        . '</div>';
+    $response = new WP_REST_Response(null, 402);
+    $response->header('payment-required', Challenge::header($product));
+    $response->header('Content-Type', 'text/html; charset=utf-8');
+    // WP_REST prints JSON; emit HTML directly instead.
+    while (ob_get_level() > 0) {
+        ob_end_clean();
+    }
+    status_header(402);
+    header('payment-required: ' . Challenge::header($product));
+    header('Content-Type: text/html; charset=utf-8');
+    header('Cache-Control: no-store, private');
+    echo $body;
+    exit;
+}
+
+/* ---------- [x402_catalog] shortcode (theme-styled, zero custom CSS) ---------- */
+
+add_shortcode('x402_catalog', function (): string {
+    $items = [];
+    if (get_option('x402_ask_enabled')) {
+        $items[] = ['title' => 'Ask this site', 'price' => (string) get_option('x402_ask_price', '$0.02'), 'url' => rest_url('x402/v1/ask'), 'desc' => x402_ask_product()['description']];
+    }
+    foreach (x402_all_item_products() as $p) {
+        $items[] = ['title' => $p['title'], 'price' => $p['price'], 'url' => $p['url'], 'desc' => $p['description']];
+    }
+    foreach (x402_proxy_products() as $p) {
+        $items[] = ['title' => $p['title'], 'price' => $p['price'], 'url' => rest_url('x402/v1/p/' . $p['sku']), 'desc' => ''];
+    }
+    if (!$items) {
+        return '<p>Nothing is for sale yet.</p>';
+    }
+    $out = '<ul class="x402-catalog">';
+    foreach ($items as $it) {
+        $out .= '<li><strong>' . esc_html($it['title']) . '</strong> — ' . esc_html($it['price'])
+            . ($it['desc'] !== '' ? '<br><span>' . esc_html($it['desc']) . '</span>' : '')
+            . '<br><code>' . esc_html($it['url']) . '</code></li>';
+    }
+    return $out . '</ul>';
 });

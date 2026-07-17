@@ -11,7 +11,7 @@ final class Settlements
     }
 
     /** True if this tx was recorded now; false if it was already recorded (duplicate → redeliver, don't recharge). */
-    public function record_once(string $product_ref, int $amount_micro, array $settlement): bool
+    public function record_once(string $product_ref, int $amount_micro, array $settlement, string $ip_hash = ''): bool
     {
         $inserted = $this->wpdb->insert($this->wpdb->prefix . 'x402_settlements', [
             'tx_hash'           => $settlement['tx'],
@@ -19,9 +19,31 @@ final class Settlements
             'product_ref'       => $product_ref,
             'amount_usdc_micro' => $amount_micro,
             'network'           => $settlement['network'],
+            'ip_hash'           => $ip_hash,
             'created_at'        => gmdate('Y-m-d H:i:s'),
         ]);
         return $inserted !== false;
+    }
+
+    /**
+     * A prior settled purchase of this product by the same source within the window.
+     * The facilitator rejects replayed payments (spent nonce), so redelivery must be
+     * granted here — not by re-submitting the payment (Tier 0 finding).
+     */
+    public function find_redelivery_grant(string $product_ref, string $ip_hash, int $window_minutes): bool
+    {
+        if ($ip_hash === '') {
+            return false;
+        }
+        $cutoff = gmdate('Y-m-d H:i:s', time() - $window_minutes * 60);
+        $found  = $this->wpdb->get_var($this->wpdb->prepare(
+            "SELECT 1 FROM {$this->wpdb->prefix}x402_settlements
+             WHERE product_ref = %s AND ip_hash = %s AND created_at >= %s LIMIT 1",
+            $product_ref,
+            $ip_hash,
+            $cutoff
+        ));
+        return $found !== null;
     }
 
     /** dbDelta-compatible schema. */
@@ -34,9 +56,11 @@ final class Settlements
             product_ref varchar(191) NOT NULL,
             amount_usdc_micro bigint unsigned NOT NULL,
             network varchar(32) NOT NULL,
+            ip_hash char(64) NOT NULL DEFAULT '',
             created_at datetime NOT NULL,
             PRIMARY KEY  (id),
-            UNIQUE KEY tx_hash (tx_hash)
+            UNIQUE KEY tx_hash (tx_hash),
+            KEY redelivery (product_ref, ip_hash, created_at)
         ) $charset_collate;";
     }
 }

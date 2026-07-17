@@ -11,13 +11,16 @@ namespace X402;
 final class Facilitator
 {
     private string $url;
-    /** @var callable(string, array): array{code:int, body:array, error?:string} */
+    /** @var callable(string, array, array): array{code:int, body:array, error?:string} */
     private $transport;
+    /** @var callable(string): array<string,string>|null per-endpoint auth headers (CDP mainnet) */
+    private $auth;
 
-    public function __construct(string $url, ?callable $transport = null)
+    public function __construct(string $url, ?callable $transport = null, ?callable $auth = null)
     {
         $this->url = rtrim($url, '/');
         $this->transport = $transport ?? [self::class, 'wp_transport'];
+        $this->auth = $auth;
     }
 
     /** Decode an X-PAYMENT header: base64 JSON object with x402Version, verbatim. */
@@ -89,14 +92,14 @@ final class Facilitator
             'x402Version'         => $payment_payload['x402Version'],
             'paymentPayload'      => $payment_payload,
             'paymentRequirements' => $requirements,
-        ]);
+        ], $this->auth !== null ? ($this->auth)($endpoint) : []);
     }
 
     /** Default transport: WordPress HTTP API. Only reachable inside WP. */
-    private static function wp_transport(string $url, array $body): array
+    private static function wp_transport(string $url, array $body, array $headers = []): array
     {
         $response = \wp_remote_post($url, [
-            'headers' => ['Content-Type' => 'application/json'],
+            'headers' => array_merge(['Content-Type' => 'application/json'], $headers),
             'body'    => (string) json_encode($body),
             'timeout' => 30,
         ]);

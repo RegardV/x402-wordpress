@@ -7,7 +7,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-const X402_DB_VERSION = 2;
+const X402_DB_VERSION = 3;
 
 /** Chunks live in their own table because FULLTEXT is the whole point (dbDelta can't manage FULLTEXT keys). */
 function x402_chunks_table_sql(): string
@@ -27,6 +27,22 @@ function x402_chunks_table_sql(): string
     ) $charset";
 }
 
+/** Request funnel log — the 402→paid conversion view nobody else shows. */
+function x402_requests_table_sql(): string
+{
+    global $wpdb;
+    return "CREATE TABLE {$wpdb->prefix}x402_requests (
+        id bigint unsigned NOT NULL AUTO_INCREMENT,
+        product_ref varchar(191) NOT NULL,
+        outcome varchar(20) NOT NULL,
+        ip_hash char(64) NOT NULL,
+        created_at datetime NOT NULL,
+        PRIMARY KEY  (id),
+        KEY product_outcome (product_ref, outcome),
+        KEY created_at (created_at)
+    ) {$wpdb->get_charset_collate()};";
+}
+
 function x402_upgrade_db(): void
 {
     global $wpdb;
@@ -35,6 +51,7 @@ function x402_upgrade_db(): void
     }
     require_once ABSPATH . 'wp-admin/includes/upgrade.php';
     dbDelta(\X402\Settlements::table_sql($wpdb->prefix, $wpdb->get_charset_collate()));
+    dbDelta(x402_requests_table_sql());
     $wpdb->query(x402_chunks_table_sql());
     update_option('x402_db_version', X402_DB_VERSION);
 }

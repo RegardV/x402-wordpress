@@ -62,6 +62,23 @@ final class FacilitatorTest extends TestCase
         $this->assertFalse($http400->verify($this->payment, $this->requirements)['ok']);
     }
 
+    public function testAuthProviderHeadersReachTheTransportPerEndpoint(): void
+    {
+        $seen = [];
+        $f = new Facilitator(
+            'https://cdp',
+            function (string $url, array $body, array $headers = []) use (&$seen) {
+                $seen[] = ['url' => $url, 'headers' => $headers];
+                return ['code' => 200, 'body' => ['isValid' => true, 'success' => true, 'transaction' => '0x1', 'payer' => '0x2', 'network' => 'n']];
+            },
+            fn (string $endpoint): array => ['Authorization' => "Bearer jwt-for-$endpoint"]
+        );
+        $f->verify($this->payment, $this->requirements);
+        $f->settle($this->payment, $this->requirements);
+        $this->assertSame('Bearer jwt-for-verify', $seen[0]['headers']['Authorization']);
+        $this->assertSame('Bearer jwt-for-settle', $seen[1]['headers']['Authorization']);
+    }
+
     public function testSettleReturnsTransactionDetails(): void
     {
         $seen = [];

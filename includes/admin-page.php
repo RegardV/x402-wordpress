@@ -2,6 +2,7 @@
 declare(strict_types=1);
 
 use X402\Address;
+use X402\Crypto;
 use X402\Price;
 use X402\Sanitizer;
 
@@ -14,15 +15,33 @@ add_action('admin_menu', function (): void {
 });
 
 add_action('admin_init', function (): void {
-    register_setting('x402', 'x402_pay_to', [
+    $address_setting = fn (string $opt) => [
+        'type'              => 'string',
+        'sanitize_callback' => function ($value) use ($opt): string {
+            $value = trim((string) $value);
+            if ($value !== '' && !Address::is_valid($value)) {
+                add_settings_error($opt, $opt, 'Not a valid address — expected 0x followed by 40 hex characters.');
+                return (string) get_option($opt, '');
+            }
+            return $value;
+        },
+    ];
+    register_setting('x402', 'x402_pay_to_testnet', $address_setting('x402_pay_to_testnet'));
+    register_setting('x402', 'x402_pay_to_mainnet', $address_setting('x402_pay_to_mainnet'));
+    register_setting('x402', 'x402_network', [
+        'type'              => 'string',
+        'sanitize_callback' => fn ($v): string => $v === X402_MAINNET ? X402_MAINNET : X402_TESTNET,
+    ]);
+    register_setting('x402', 'x402_cdp_key_id', ['type' => 'string', 'sanitize_callback' => 'sanitize_text_field']);
+    // CDP secret: encrypt at rest, and never round-trip the ciphertext through the form.
+    register_setting('x402', 'x402_cdp_secret_input', [
         'type'              => 'string',
         'sanitize_callback' => function ($value): string {
             $value = trim((string) $value);
-            if ($value !== '' && !Address::is_valid($value)) {
-                add_settings_error('x402_pay_to', 'x402_pay_to', 'Not a valid address — expected 0x followed by 40 hex characters.');
-                return (string) get_option('x402_pay_to', '');
+            if ($value !== '') {
+                update_option('x402_cdp_secret_enc', Crypto::encrypt($value, wp_salt('secure_auth')), false);
             }
-            return $value;
+            return ''; // never store the raw input option itself
         },
     ]);
     register_setting('x402', 'x402_ask_enabled', ['type' => 'boolean', 'sanitize_callback' => 'rest_sanitize_boolean']);
@@ -48,7 +67,7 @@ add_action('admin_init', function (): void {
 });
 
 add_action('admin_notices', function (): void {
-    if (get_option('x402_pay_to', '') === '' && current_user_can('manage_options')) {
+    if (x402_pay_to() === '' && current_user_can('manage_options')) {
         $url = esc_url(admin_url('admin.php?page=x402'));
         echo '<div class="notice notice-warning"><p><strong>x402:</strong> set your receive wallet address to start selling — <a href="' . $url . '">x402 settings</a>.</p></div>';
     }
@@ -209,26 +228,51 @@ add_action('admin_post_x402_proxy_delete', function (): void {
 function x402_render_admin_page(): void
 {
     global $wpdb;
-    $pay_to      = (string) get_option('x402_pay_to', '');
+    $network     = x402_active_network();
+    $is_mainnet  = $network === X402_MAINNET;
     $table       = $wpdb->prefix . 'x402_settlements';
     $sales       = $wpdb->get_results("SELECT tx_hash, payer, product_ref, amount_usdc_micro, network, created_at FROM $table ORDER BY id DESC LIMIT 10", ARRAY_A) ?: [];
     $totals      = $wpdb->get_row("SELECT COUNT(*) AS n, COALESCE(SUM(amount_usdc_micro),0) AS micro FROM $table", ARRAY_A) ?: ['n' => 0, 'micro' => 0];
     $chunk_stats = $wpdb->get_row("SELECT COUNT(*) AS n, COUNT(DISTINCT CONCAT(source, source_id)) AS docs FROM {$wpdb->prefix}x402_chunks", ARRAY_A) ?: ['n' => 0, 'docs' => 0];
+    $funnel      = $wpdb->get_results("SELECT outcome, COUNT(*) AS n FROM {$wpdb->prefix}x402_requests GROUP BY outcome", OBJECT_K) ?: [];
+    $n402        = (int) ($funnel['unpaid_402']->n ?? 0);
+    $npaid       = (int) ($funnel['paid_200']->n ?? 0);
+    $conv        = ($n402 + $npaid) > 0 ? round(100 * $npaid / ($n402 + $npaid), 1) : 0.0;
+    $has_cdp     = get_option('x402_cdp_key_id', '') !== '' && get_option('x402_cdp_secret_enc', '') !== '';
     ?>
     <div class="wrap">
         <h1>x402 — sell to AI agents for USDC</h1>
         <?php settings_errors(); ?>
 
-        <h2 class="title">Wallet &amp; ask endpoint</h2>
-        <p>Payments settle on-chain <strong>directly to this address</strong>. Receive address only — no private keys are ever stored in WordPress.</p>
+        <h2 class="title">Network, wallets &amp; ask endpoint</h2>
+        <p>Payments settle on-chain <strong>directly to your address</strong>. Receive addresses only — no private keys are ever stored in WordPress. Currently active: <strong><?php echo $is_mainnet ? 'Base mainnet (real USDC)' : 'Base Sepolia testnet'; ?></strong>.</p>
         <form method="post" action="options.php">
             <?php settings_fields('x402'); ?>
             <table class="form-table" role="presentation">
                 <tr>
-                    <th scope="row"><label for="x402_pay_to">Receive address (Base Sepolia testnet)</label></th>
+                    <th scope="row">Active network</th>
                     <td>
-                        <input type="text" id="x402_pay_to" name="x402_pay_to" class="regular-text code" value="<?php echo esc_attr($pay_to); ?>" placeholder="0x…" />
-                        <p class="description">Tier 2 runs on the Base Sepolia testnet (facilitator: x402.org, no API keys). Mainnet lands with Tier 1's settings channels.</p>
+                        <label><input type="radio" name="x402_network" value="<?php echo esc_attr(X402_TESTNET); ?>" <?php checked(!$is_mainnet); ?> /> Testnet (Base Sepolia — facilitator x402.org, no keys)</label><br/>
+                        <label><input type="radio" name="x402_network" value="<?php echo esc_attr(X402_MAINNET); ?>" <?php checked($is_mainnet); ?> /> Mainnet (Base — real USDC, needs CDP keys below)</label>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="x402_pay_to_testnet">Testnet receive address</label></th>
+                    <td><input type="text" id="x402_pay_to_testnet" name="x402_pay_to_testnet" class="regular-text code" value="<?php echo esc_attr((string) get_option('x402_pay_to_testnet', (string) get_option('x402_pay_to', ''))); ?>" placeholder="0x…" /></td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="x402_pay_to_mainnet">Mainnet receive address</label></th>
+                    <td><input type="text" id="x402_pay_to_mainnet" name="x402_pay_to_mainnet" class="regular-text code" value="<?php echo esc_attr((string) get_option('x402_pay_to_mainnet', '')); ?>" placeholder="0x…" /></td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="x402_cdp_key_id">CDP API key ID (mainnet)</label></th>
+                    <td><input type="text" id="x402_cdp_key_id" name="x402_cdp_key_id" class="regular-text code" value="<?php echo esc_attr((string) get_option('x402_cdp_key_id', '')); ?>" placeholder="organizations/…/apiKeys/…" /></td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="x402_cdp_secret_input">CDP API key secret (mainnet)</label></th>
+                    <td>
+                        <input type="password" id="x402_cdp_secret_input" name="x402_cdp_secret_input" class="regular-text code" value="" placeholder="<?php echo $has_cdp ? '•••••• (stored — leave blank to keep)' : 'base64 Ed25519 secret'; ?>" autocomplete="off" />
+                        <p class="description">Stored encrypted at rest. From the <a href="https://portal.cdp.coinbase.com" target="_blank" rel="noopener">Coinbase Developer Platform</a> — free, this is what authenticates mainnet settlement (funds still go to your wallet, never Coinbase's).</p>
                     </td>
                 </tr>
                 <tr>
@@ -240,7 +284,7 @@ function x402_render_admin_page(): void
                 </tr>
                 <tr>
                     <th scope="row">Reverse proxy</th>
-                    <td><label><input type="checkbox" name="x402_trust_proxy" value="1" <?php checked(get_option('x402_trust_proxy')); ?> /> This site is behind a trusted proxy/CDN that sets <code>X-Forwarded-For</code> (enables per-visitor rate limiting behind Cloudflare etc. — leave off otherwise, the header is forgeable)</label></td>
+                    <td><label><input type="checkbox" name="x402_trust_proxy" value="1" <?php checked(get_option('x402_trust_proxy')); ?> /> This site is behind a trusted proxy/CDN that sets <code>X-Forwarded-For</code> (used for per-visitor rate limiting <strong>and redelivery grants</strong> — leave off unless a real proxy strips inbound XFF, or a spoofed header could win free re-delivery of another buyer's purchase)</label></td>
                 </tr>
                 <tr>
                     <th scope="row"><label for="x402_ask_price">Price per query</label></th>
@@ -305,11 +349,16 @@ function x402_render_admin_page(): void
             <?php submit_button('Add proxy product', 'secondary', 'submit', false); ?>
         </form>
 
+        <h2 class="title">Sell any post, page, or file</h2>
+        <p>Edit any post, page, or media item — the <strong>“Sell to AI agents (x402)”</strong> box in the sidebar adds a price and puts it behind the paywall. Drop <code>[x402_catalog]</code> on a page to list everything for sale (styled by your theme).</p>
+
         <h2 class="title">Your store endpoints</h2>
-        <?php if ($pay_to === '') : ?>
-            <p><span class="dashicons dashicons-warning" style="color:#dba617"></span> Not selling yet — save a receive address above first.</p>
+        <?php if (x402_pay_to() === '') : ?>
+            <p><span class="dashicons dashicons-warning" style="color:#dba617"></span> Not selling yet — save a receive address for the active network above first.</p>
+        <?php elseif ($is_mainnet && !x402_mainnet_ready()) : ?>
+            <p><span class="dashicons dashicons-warning" style="color:#dba617"></span> Mainnet selected but CDP key ID/secret are missing — add them above to settle real payments.</p>
         <?php else : ?>
-            <p><span class="dashicons dashicons-yes-alt" style="color:#00a32a"></span> Live. Agents hitting these URLs get an HTTP 402 challenge and can pay in USDC:</p>
+            <p><span class="dashicons dashicons-yes-alt" style="color:#00a32a"></span> Live on <?php echo $is_mainnet ? 'mainnet' : 'testnet'; ?>. Agents hitting these URLs get an HTTP 402 challenge and can pay in USDC:</p>
         <?php endif; ?>
         <table class="widefat striped" style="max-width:900px">
             <thead><tr><th>What</th><th>URL</th></tr></thead>
@@ -321,7 +370,7 @@ function x402_render_admin_page(): void
         </table>
 
         <h2 class="title">Sales</h2>
-        <p><strong><?php echo (int) $totals['n']; ?></strong> settled · <strong>$<?php echo esc_html(number_format(((int) $totals['micro']) / 1_000_000, 2)); ?></strong> USDC total</p>
+        <p><strong><?php echo (int) $totals['n']; ?></strong> settled · <strong>$<?php echo esc_html(number_format(((int) $totals['micro']) / 1_000_000, 2)); ?></strong> USDC total · funnel: <strong><?php echo $n402; ?></strong> saw the price, <strong><?php echo $npaid; ?></strong> paid (<strong><?php echo esc_html((string) $conv); ?>%</strong> conversion)</p>
         <?php if ($sales) : ?>
             <table class="widefat striped" style="max-width:900px">
                 <thead><tr><th>When (UTC)</th><th>Product</th><th>Amount</th><th>Payer</th><th>Transaction</th><th>Network</th></tr></thead>

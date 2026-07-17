@@ -1,0 +1,14 @@
+{
+    "name": "regardv/x402-for-wordpress",
+    "description": "x402 for WordPress — sell files, endpoints, and answers to AI agents for USDC. Self-custodial, 0% fees.",
+    "license": "GPL-2.0-or-later",
+    "autoload": {
+        "classmap": ["includes/"]
+    },
+    "require": {
+        "php": ">=8.0"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^11"
+    }
+}

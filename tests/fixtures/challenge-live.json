@@ -1,0 +1,20 @@
+{
+  "x402Version": 2,
+  "error": "Payment required",
+  "resource": {
+    "url": "https://x402.inkypyrus.com/ask-k8s",
+    "description": "Paid retrieval over a Kubernetes knowledge vault that explains the whole system as a company — control plane as head office, pods on the floor, scheduling, scaling, reliability, security. POST {\"query\": \"...\"} and get cited passages.",
+    "mimeType": ""
+  },
+  "accepts": [
+    {
+      "scheme": "exact",
+      "network": "eip155:8453",
+      "amount": "20000",
+      "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+      "payTo": "0x680D90AdDB54131E946e15cb1757eE98DA4C54DB",
+      "maxTimeoutSeconds": 300,
+      "extra": { "name": "USD Coin", "version": "2" }
+    }
+  ]
+}

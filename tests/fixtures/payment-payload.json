@@ -1,0 +1,19 @@
+{
+  "x402Version": 2,
+  "payload": {
+    "authorization": {
+      "from": "0xdd3CA2904fd97814DB2f6B81c3E163138c764e95",
+      "to": "0x680D90AdDB54131E946e15cb1757eE98DA4C54DB",
+      "value": "1000000",
+      "validAfter": "1784212282",
+      "validBefore": "1784213182",
+      "nonce": "0x0946fd418f91e1db34ad1a08f327ad693fcd3eb3c0e82cf0ce9cb0670b2b3e65"
+    },
+    "signature": "0xb2a109071cecacc6d31199a57144f5756037bb710358f730594d0795e74be91440c71d0608d088f4cc56529c8dd36c7e39f6db9a7ba5d8b337c3b268dabefd881b"
+  },
+  "resource": {
+    "url": "https://x402.inkypyrus.com/farming-the-soil-biome-secret-to-soil-fertility/AfrEcoSoil_%20Bio1_Soil_v4_2026_CJR.pdf",
+    "description": "captured from production PAYMENT_DEBUG journal 2026-07-16",
+    "mimeType": "application/pdf"
+  }
+}

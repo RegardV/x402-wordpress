@@ -2,3 +2,4 @@ vendor/
 composer.phar
 node_modules/
 .atg/
+.phpunit.result.cache

@@ -40,6 +40,35 @@ final class SanitizerTest extends TestCase
         $this->assertSame("# T\nbody", Sanitizer::clean("# T\nbody"));
     }
 
+    public function testRejectsInlineSecretTokens(): void
+    {
+        // Fixtures are concatenated so secret scanners (incl. GitHub push
+        // protection) never see a token-shaped literal in this file.
+        foreach ([
+            'aws creds: ' . 'AKIA' . 'IOSFODNN7EXAMPLE' . ' in a note',
+            'openai ' . 'sk-' . 'proj-abcdefghijklmnopqrstuvwxyz123456',
+            'github ' . 'ghp_' . 'abcdefghijklmnopqrstuvwxyz0123456789',
+            'slack ' . 'xoxb-' . '123456789012-abcdefghijklmnop',
+        ] as $leaky) {
+            $this->assertNull(Sanitizer::clean($leaky), "should reject: $leaky");
+        }
+    }
+
+    public function testBenignSecretLookalikesSurvive(): void
+    {
+        $this->assertNotNull(Sanitizer::clean('the ask-k8s endpoint and my sk-late notes'));
+        $this->assertNotNull(Sanitizer::clean('ghp_short is not a token; AKIA alone is fine'));
+    }
+
+    public function testSafeContentTypePassesMediaTypesAndNeutralizesGarbage(): void
+    {
+        $this->assertSame('application/json', Sanitizer::safe_content_type('application/json'));
+        $this->assertSame('text/html; charset=utf-8', Sanitizer::safe_content_type('text/html; charset=utf-8'));
+        $this->assertSame('application/octet-stream', Sanitizer::safe_content_type("evil\r\nX-Inject: 1"));
+        $this->assertSame('application/octet-stream', Sanitizer::safe_content_type(''));
+        $this->assertSame('application/octet-stream', Sanitizer::safe_content_type('no-slash'));
+    }
+
     public function testRejectsBinaryInvalidUtf8AndKeyMaterial(): void
     {
         $this->assertNull(Sanitizer::clean("has\x00null"));

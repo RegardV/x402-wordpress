@@ -26,6 +26,7 @@ add_action('admin_init', function (): void {
         },
     ]);
     register_setting('x402', 'x402_ask_enabled', ['type' => 'boolean', 'sanitize_callback' => 'rest_sanitize_boolean']);
+    register_setting('x402', 'x402_trust_proxy', ['type' => 'boolean', 'sanitize_callback' => 'rest_sanitize_boolean']);
     register_setting('x402', 'x402_ask_index_posts', ['type' => 'boolean', 'sanitize_callback' => 'rest_sanitize_boolean']);
     register_setting('x402', 'x402_ask_price', [
         'type'              => 'string',
@@ -236,6 +237,10 @@ function x402_render_admin_page(): void
                         <label><input type="checkbox" name="x402_ask_enabled" value="1" <?php checked(get_option('x402_ask_enabled')); ?> /> Sell answers: paid <code>POST /x402/v1/ask</code> over your indexed content</label><br/>
                         <label><input type="checkbox" name="x402_ask_index_posts" value="1" <?php checked(get_option('x402_ask_index_posts')); ?> /> Index published posts &amp; pages (run Reindex after changing)</label>
                     </td>
+                </tr>
+                <tr>
+                    <th scope="row">Reverse proxy</th>
+                    <td><label><input type="checkbox" name="x402_trust_proxy" value="1" <?php checked(get_option('x402_trust_proxy')); ?> /> This site is behind a trusted proxy/CDN that sets <code>X-Forwarded-For</code> (enables per-visitor rate limiting behind Cloudflare etc. — leave off otherwise, the header is forgeable)</label></td>
                 </tr>
                 <tr>
                     <th scope="row"><label for="x402_ask_price">Price per query</label></th>

@@ -94,20 +94,39 @@ function x402_402_response(array $product): WP_REST_Response
 
 function x402_client_ip_hash(): string
 {
-    $ip = trim(explode(',', (string) ($_SERVER['HTTP_X_FORWARDED_FOR'] ?? $_SERVER['REMOTE_ADDR'] ?? ''))[0]);
+    // X-Forwarded-For is client-forgeable; honor it only when the operator says
+    // a trusted proxy sets it, else a spoofed header defeats rate limiting.
+    $ip = (string) ($_SERVER['REMOTE_ADDR'] ?? '');
+    if (get_option('x402_trust_proxy') && !empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
+        $ip = trim(explode(',', (string) $_SERVER['HTTP_X_FORWARDED_FOR'])[0]);
+    }
     return hash_hmac('sha256', $ip, wp_salt('auth'));
 }
 
-/** Sliding transient counter. True = allowed. */
+/** Fixed-window counter via an atomic options-table upsert (transients race under bursts). True = allowed. */
 function x402_rate_limit(string $bucket, int $limit, int $window_seconds): bool
 {
-    $key   = 'x402_rl_' . $bucket;
-    $count = (int) get_transient($key);
-    if ($count >= $limit) {
-        return false;
+    global $wpdb;
+    $window = (int) floor(time() / $window_seconds);
+    $key    = 'x402_rl_' . substr($bucket, 0, 32) . '_' . $window;
+    $wpdb->query($wpdb->prepare(
+        "INSERT INTO {$wpdb->options} (option_name, option_value, autoload)
+         VALUES (%s, '1', 'no')
+         ON DUPLICATE KEY UPDATE option_value = option_value + 1",
+        $key
+    ));
+    $count = (int) $wpdb->get_var($wpdb->prepare(
+        "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s",
+        $key
+    ));
+    if (random_int(1, 100) === 1) { // lazy stale-bucket cleanup
+        $wpdb->query($wpdb->prepare(
+            "DELETE FROM {$wpdb->options} WHERE option_name LIKE %s AND option_name NOT LIKE %s",
+            $wpdb->esc_like('x402_rl_') . '%',
+            '%\_' . $window
+        ));
     }
-    set_transient($key, $count + 1, $window_seconds);
-    return true;
+    return $count <= $limit;
 }
 
 /**
@@ -170,7 +189,8 @@ function x402_emit_raw(array $settled, int $status, string $content_type, string
     }
     status_header($status);
     header('PAYMENT-RESPONSE: ' . Facilitator::receipt_header($settled));
-    header('Content-Type: ' . $content_type);
+    header('Content-Type: ' . \X402\Sanitizer::safe_content_type($content_type));
+    header('X-Content-Type-Options: nosniff');
     echo $bytes;
     exit;
 }
@@ -277,6 +297,7 @@ add_action('rest_api_init', function (): void {
 
                 $response = new WP_REST_Response(['query' => $query, 'count' => count($results), 'results' => $results], 200);
                 $response->header('PAYMENT-RESPONSE', Facilitator::receipt_header($settled));
+                $response->header('X-Content-Type-Options', 'nosniff');
                 return $response;
             });
         },

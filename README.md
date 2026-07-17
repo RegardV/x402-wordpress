@@ -29,12 +29,16 @@ Roadmap (spec'd): per-post/page/attachment products via meta box, machine catalo
 
 ## Try it
 
+On any WordPress: install + activate, then open the **x402** menu in wp-admin — set your receive wallet address there, and the page shows your live store endpoints and every settled sale. That's the whole setup.
+
+Or from scratch with the bundled dev stack:
+
 ```bash
 docker compose -p x402wp up -d
 docker exec x402wp-cli-1 wp core install --url=http://localhost:8890 --title=x402dev \
   --admin_user=admin --admin_password=admin --admin_email=dev@example.com --skip-email
 docker exec x402wp-cli-1 wp plugin activate x402-for-wordpress
-docker exec x402wp-cli-1 wp option update x402_pay_to 0xYourReceiveAddress
+# then set the wallet in wp-admin → x402 (or: wp option update x402_pay_to 0xYourAddress)
 
 curl -sD - "http://localhost:8890/?rest_route=/x402/v1/demo"   # → 402 + challenge
 ```

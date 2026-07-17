@@ -18,6 +18,8 @@ require_once __DIR__ . '/includes/class-challenge.php';
 require_once __DIR__ . '/includes/class-price.php';
 require_once __DIR__ . '/includes/class-facilitator.php';
 require_once __DIR__ . '/includes/class-settlements.php';
+require_once __DIR__ . '/includes/class-address.php';
+require_once __DIR__ . '/includes/admin-page.php';
 
 use X402\Challenge;
 use X402\Facilitator;

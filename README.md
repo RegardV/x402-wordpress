@@ -21,11 +21,17 @@ Agent                        WordPress                        Facilitator
 
 No cryptography runs in WordPress and **no private keys ever exist in WordPress** — the facilitator verifies signatures and settles on-chain; the plugin is careful HTTP/JSON.
 
-## Status: Tier 0 — protocol proof (working)
+## Status: Tier 2 — the ask lane (working)
 
-One hardcoded demo product, sold end-to-end on Base Sepolia testnet: real purchases settled on-chain against this code by an independent x402 client. Current wire format (v2, SDK ≥2.18 `payment-signature` header with `X-PAYMENT` fallback), CDP description-length cap, and cache hardening (`no-store` + `DONOTCACHEPAGE`) are already baked in.
+Everything below is settled on-chain against this code by an independent x402 client on Base Sepolia testnet:
 
-Roadmap (spec'd): per-post/page/attachment products via meta box, machine catalog, request-funnel analytics, settings UI (separate testnet/mainnet wallet channels), then the flagship **paid `/ask` lane** — upload a markdown vault, agents pay per question and get cited passages. WooCommerce bridge and human checkout are deliberate non-goals for the MVP.
+- **Paid `/ask` endpoint** — `POST {"query": "..."}`, agents pay per question and get cited passages (excerpt + source + heading + relevance) from your indexed content. SQLite-free: MySQL FULLTEXT with OR-ranked natural-language queries.
+- **Corpus import** — upload a zip of markdown (an Obsidian vault, research notes) in wp-admin. Files are sanitized on the way in (dotfiles, binaries, key material rejected; frontmatter stripped), stored privately — never rendered on your site — and sold only as answers.
+- **Proxy products** — price any operator-entered upstream URL; buyers pay here, the request is forwarded, the response delivered.
+- **wp-admin page** — wallet setting, ask endpoint config, corpus import with accept/reject report, proxy product management, knowledge-index stats, sales ledger.
+- Current wire format (v2, SDK ≥2.18 `payment-signature` with `X-PAYMENT` fallback), CDP description cap, cache hardening (`no-store` + `DONOTCACHEPAGE`), per-ip rate limiting, `UNIQUE(tx_hash)` ledger.
+
+Roadmap (spec'd): Tier 1 — per-post/page/attachment products via meta box, mainnet wallet channels + CDP keys, funnel analytics, redelivery grace; Tier 3 — wordpress.org submission, Bazaar discoverability, demand pricing. WooCommerce bridge and human checkout are deliberate non-goals for the MVP.
 
 ## Try it
 

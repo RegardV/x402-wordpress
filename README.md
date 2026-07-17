@@ -1,3 +1,7 @@
+<p align="center">
+  <a href="https://x402.inkypyrus.com"><img src="assets/banner.jpg" alt="x402 for WordPress" width="760"></a>
+</p>
+
 # x402 for WordPress
 
 **by [realandworks.com](https://realandworks.com)**

@@ -227,6 +227,11 @@ add_action('admin_post_x402_proxy_delete', function (): void {
 
 function x402_render_admin_page(): void
 {
+    // First run, or an explicit relaunch / network switch, hands the page to the wizard.
+    if (x402_wizard_active()) {
+        x402_render_wizard();
+        return;
+    }
     global $wpdb;
     $network     = x402_active_network();
     $is_mainnet  = $network === X402_MAINNET;
@@ -243,6 +248,7 @@ function x402_render_admin_page(): void
     <div class="wrap">
         <h1>x402 — sell to AI agents for USDC</h1>
         <?php settings_errors(); ?>
+        <?php x402_network_switch_banner(); ?>
 
         <h2 class="title">Network, wallets &amp; ask endpoint</h2>
         <p>Payments settle on-chain <strong>directly to your address</strong>. Receive addresses only — no private keys are ever stored in WordPress. Currently active: <strong><?php echo $is_mainnet ? 'Base mainnet (real USDC)' : 'Base Sepolia testnet'; ?></strong>.</p>

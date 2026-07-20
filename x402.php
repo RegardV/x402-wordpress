@@ -24,8 +24,10 @@ require_once __DIR__ . '/includes/class-sanitizer.php';
 require_once __DIR__ . '/includes/class-search.php';
 require_once __DIR__ . '/includes/class-cdp-jwt.php';
 require_once __DIR__ . '/includes/class-crypto.php';
+require_once __DIR__ . '/includes/class-setup.php';
 require_once __DIR__ . '/includes/indexer.php';
 require_once __DIR__ . '/includes/products.php';
+require_once __DIR__ . '/includes/wizard.php';
 require_once __DIR__ . '/includes/admin-page.php';
 
 use X402\Challenge;

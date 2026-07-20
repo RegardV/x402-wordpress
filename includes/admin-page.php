@@ -324,7 +324,10 @@ function x402_tab_network(): void
             </tr>
             <tr>
                 <th scope="row">Reverse proxy</th>
-                <td><label><input type="checkbox" name="x402_trust_proxy" value="1" <?php checked(get_option('x402_trust_proxy')); ?> /> This site is behind a trusted proxy/CDN that sets <code>X-Forwarded-For</code> (used for per-visitor rate limiting <strong>and redelivery grants</strong> — leave off unless a real proxy strips inbound XFF, or a spoofed header could win free re-delivery of another buyer's purchase)</label></td>
+                <td>
+                    <label><input type="checkbox" name="x402_trust_proxy" value="1" <?php checked(get_option('x402_trust_proxy')); ?> /> This site is behind a trusted proxy/CDN that sets <code>X-Forwarded-For</code> (used for per-visitor rate limiting <strong>and redelivery grants</strong>).</label>
+                    <p class="description">Leave off unless a real proxy strips inbound XFF, or a spoofed header could win free re-delivery of another buyer's purchase. <a href="https://github.com/RegardV/x402-wordpress/blob/master/docs/reverse-proxy.md" target="_blank" rel="noopener">When to enable this →</a></p>
+                </td>
             </tr>
         </table>
         <?php submit_button('Save'); ?>

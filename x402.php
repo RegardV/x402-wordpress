@@ -2,7 +2,7 @@
 /**
  * Plugin Name: x402 for WordPress
  * Description: Sell files, endpoints, and answers to AI agents for USDC over the x402 protocol. Self-custodial, 0% fees.
- * Version: 0.1.0
+ * Version: 0.2.0
  * Requires PHP: 8.0
  * License: GPL-2.0-or-later
  * Text Domain: x402

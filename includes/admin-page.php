@@ -44,10 +44,12 @@ add_action('admin_init', function (): void {
             return ''; // never store the raw input option itself
         },
     ]);
-    register_setting('x402', 'x402_ask_enabled', ['type' => 'boolean', 'sanitize_callback' => 'rest_sanitize_boolean']);
     register_setting('x402', 'x402_trust_proxy', ['type' => 'boolean', 'sanitize_callback' => 'rest_sanitize_boolean']);
-    register_setting('x402', 'x402_ask_index_posts', ['type' => 'boolean', 'sanitize_callback' => 'rest_sanitize_boolean']);
-    register_setting('x402', 'x402_ask_price', [
+    // Ask settings live in their own group so the Knowledge tab's form and the
+    // Network tab's form never reset each other's checkboxes on save.
+    register_setting('x402_ask', 'x402_ask_enabled', ['type' => 'boolean', 'sanitize_callback' => 'rest_sanitize_boolean']);
+    register_setting('x402_ask', 'x402_ask_index_posts', ['type' => 'boolean', 'sanitize_callback' => 'rest_sanitize_boolean']);
+    register_setting('x402_ask', 'x402_ask_price', [
         'type'              => 'string',
         'sanitize_callback' => function ($value): string {
             $value = trim((string) $value);
@@ -60,7 +62,7 @@ add_action('admin_init', function (): void {
             }
         },
     ]);
-    register_setting('x402', 'x402_ask_description', [
+    register_setting('x402_ask', 'x402_ask_description', [
         'type'              => 'string',
         'sanitize_callback' => fn ($v): string => mb_substr(sanitize_text_field((string) $v), 0, 250),
     ]);
@@ -225,6 +227,14 @@ add_action('admin_post_x402_proxy_delete', function (): void {
 
 /* ---------- the page ---------- */
 
+const X402_TABS = [
+    'network'   => 'Network',
+    'knowledge' => 'Knowledge index',
+    'endpoints' => 'Store endpoints',
+    'sales'     => 'Sales',
+    'proxy'     => 'Proxy endpoints',
+];
+
 function x402_render_admin_page(): void
 {
     // First run, or an explicit relaunch / network switch, hands the page to the wizard.
@@ -232,170 +242,217 @@ function x402_render_admin_page(): void
         x402_render_wizard();
         return;
     }
-    global $wpdb;
-    $network     = x402_active_network();
-    $is_mainnet  = $network === X402_MAINNET;
-    $table       = $wpdb->prefix . 'x402_settlements';
-    $sales       = $wpdb->get_results("SELECT tx_hash, payer, product_ref, amount_usdc_micro, network, created_at FROM $table ORDER BY id DESC LIMIT 10", ARRAY_A) ?: [];
-    $totals      = $wpdb->get_row("SELECT COUNT(*) AS n, COALESCE(SUM(amount_usdc_micro),0) AS micro FROM $table", ARRAY_A) ?: ['n' => 0, 'micro' => 0];
-    $chunk_stats = $wpdb->get_row("SELECT COUNT(*) AS n, COUNT(DISTINCT CONCAT(source, source_id)) AS docs FROM {$wpdb->prefix}x402_chunks", ARRAY_A) ?: ['n' => 0, 'docs' => 0];
-    $funnel      = $wpdb->get_results("SELECT outcome, COUNT(*) AS n FROM {$wpdb->prefix}x402_requests GROUP BY outcome", OBJECT_K) ?: [];
-    $n402        = (int) ($funnel['unpaid_402']->n ?? 0);
-    $npaid       = (int) ($funnel['paid_200']->n ?? 0);
-    $conv        = ($n402 + $npaid) > 0 ? round(100 * $npaid / ($n402 + $npaid), 1) : 0.0;
-    $has_cdp     = get_option('x402_cdp_key_id', '') !== '' && get_option('x402_cdp_secret_enc', '') !== '';
+    $tab = isset($_GET['tab']) && isset(X402_TABS[$_GET['tab']]) ? (string) $_GET['tab'] : 'network';
     ?>
     <div class="wrap">
         <h1>x402 — sell to AI agents for USDC</h1>
         <?php settings_errors(); ?>
         <?php x402_network_switch_banner(); ?>
+        <h2 class="nav-tab-wrapper">
+            <?php foreach (X402_TABS as $slug => $label) : ?>
+                <a href="<?php echo esc_url(admin_url('admin.php?page=x402&tab=' . $slug)); ?>"
+                   class="nav-tab <?php echo $tab === $slug ? 'nav-tab-active' : ''; ?>"><?php echo esc_html($label); ?></a>
+            <?php endforeach; ?>
+        </h2>
+        <?php
+        switch ($tab) {
+            case 'knowledge': x402_tab_knowledge(); break;
+            case 'endpoints': x402_tab_endpoints(); break;
+            case 'sales':     x402_tab_sales();     break;
+            case 'proxy':     x402_tab_proxy();     break;
+            default:          x402_tab_network();
+        }
+        ?>
+    </div>
+    <?php
+}
 
-        <h2 class="title">Network, wallets &amp; ask endpoint</h2>
-        <p>Payments settle on-chain <strong>directly to your address</strong>. Receive addresses only — no private keys are ever stored in WordPress. Currently active: <strong><?php echo $is_mainnet ? 'Base mainnet (real USDC)' : 'Base Sepolia testnet'; ?></strong>.</p>
-        <form method="post" action="options.php">
-            <?php settings_fields('x402'); ?>
-            <table class="form-table" role="presentation">
-                <tr>
-                    <th scope="row">Active network</th>
-                    <td>
-                        <label><input type="radio" name="x402_network" value="<?php echo esc_attr(X402_TESTNET); ?>" <?php checked(!$is_mainnet); ?> /> Testnet (Base Sepolia — facilitator x402.org, no keys)</label><br/>
-                        <label><input type="radio" name="x402_network" value="<?php echo esc_attr(X402_MAINNET); ?>" <?php checked($is_mainnet); ?> /> Mainnet (Base — real USDC, needs CDP keys below)</label>
-                    </td>
-                </tr>
-                <tr>
-                    <th scope="row"><label for="x402_pay_to_testnet">Testnet receive address</label></th>
-                    <td><input type="text" id="x402_pay_to_testnet" name="x402_pay_to_testnet" class="regular-text code" value="<?php echo esc_attr((string) get_option('x402_pay_to_testnet', (string) get_option('x402_pay_to', ''))); ?>" placeholder="0x…" /></td>
-                </tr>
-                <tr>
-                    <th scope="row"><label for="x402_pay_to_mainnet">Mainnet receive address</label></th>
-                    <td><input type="text" id="x402_pay_to_mainnet" name="x402_pay_to_mainnet" class="regular-text code" value="<?php echo esc_attr((string) get_option('x402_pay_to_mainnet', '')); ?>" placeholder="0x…" /></td>
-                </tr>
-                <tr>
-                    <th scope="row"><label for="x402_cdp_key_id">CDP API key ID (mainnet)</label></th>
-                    <td><input type="text" id="x402_cdp_key_id" name="x402_cdp_key_id" class="regular-text code" value="<?php echo esc_attr((string) get_option('x402_cdp_key_id', '')); ?>" placeholder="organizations/…/apiKeys/…" /></td>
-                </tr>
-                <tr>
-                    <th scope="row"><label for="x402_cdp_secret_input">CDP API key secret (mainnet)</label></th>
-                    <td>
-                        <input type="password" id="x402_cdp_secret_input" name="x402_cdp_secret_input" class="regular-text code" value="" placeholder="<?php echo $has_cdp ? '•••••• (stored — leave blank to keep)' : 'base64 Ed25519 secret'; ?>" autocomplete="off" />
-                        <p class="description">Stored encrypted at rest. From the <a href="https://portal.cdp.coinbase.com" target="_blank" rel="noopener">Coinbase Developer Platform</a> — free, this is what authenticates mainnet settlement (funds still go to your wallet, never Coinbase's).</p>
-                    </td>
-                </tr>
-                <tr>
-                    <th scope="row">Ask endpoint</th>
-                    <td>
-                        <label><input type="checkbox" name="x402_ask_enabled" value="1" <?php checked(get_option('x402_ask_enabled')); ?> /> Sell answers: paid <code>POST /x402/v1/ask</code> over your indexed content</label><br/>
-                        <label><input type="checkbox" name="x402_ask_index_posts" value="1" <?php checked(get_option('x402_ask_index_posts')); ?> /> Index published posts &amp; pages (run Reindex after changing)</label>
-                    </td>
-                </tr>
-                <tr>
-                    <th scope="row">Reverse proxy</th>
-                    <td><label><input type="checkbox" name="x402_trust_proxy" value="1" <?php checked(get_option('x402_trust_proxy')); ?> /> This site is behind a trusted proxy/CDN that sets <code>X-Forwarded-For</code> (used for per-visitor rate limiting <strong>and redelivery grants</strong> — leave off unless a real proxy strips inbound XFF, or a spoofed header could win free re-delivery of another buyer's purchase)</label></td>
-                </tr>
-                <tr>
-                    <th scope="row"><label for="x402_ask_price">Price per query</label></th>
-                    <td><input type="text" id="x402_ask_price" name="x402_ask_price" class="small-text" value="<?php echo esc_attr((string) get_option('x402_ask_price', '$0.02')); ?>" /></td>
-                </tr>
-                <tr>
-                    <th scope="row"><label for="x402_ask_description">Ask description (max 250 chars — facilitator limit)</label></th>
-                    <td><input type="text" id="x402_ask_description" name="x402_ask_description" class="large-text" maxlength="250" value="<?php echo esc_attr((string) get_option('x402_ask_description', '')); ?>" placeholder="What can agents ask this site about?" /></td>
-                </tr>
-            </table>
-            <?php submit_button('Save'); ?>
-        </form>
+function x402_tab_network(): void
+{
+    $is_mainnet = x402_active_network() === X402_MAINNET;
+    $has_cdp    = get_option('x402_cdp_key_id', '') !== '' && get_option('x402_cdp_secret_enc', '') !== '';
+    ?>
+    <p>Payments settle on-chain <strong>directly to your address</strong>. Receive addresses only — no private keys are ever stored in WordPress. Guided setup and switching happen in the <a href="<?php echo esc_url(admin_url('admin.php?page=x402&wizard=1&step=1')); ?>">setup wizard</a>; edit inline below.</p>
+    <form method="post" action="options.php">
+        <?php settings_fields('x402'); ?>
+        <table class="form-table" role="presentation">
+            <tr>
+                <th scope="row">Active network</th>
+                <td>
+                    <label><input type="radio" name="x402_network" value="<?php echo esc_attr(X402_TESTNET); ?>" <?php checked(!$is_mainnet); ?> /> Testnet (Base Sepolia — facilitator x402.org, no keys)</label><br/>
+                    <label><input type="radio" name="x402_network" value="<?php echo esc_attr(X402_MAINNET); ?>" <?php checked($is_mainnet); ?> /> Mainnet (Base — real USDC, needs CDP keys below)</label>
+                </td>
+            </tr>
+            <tr>
+                <th scope="row"><label for="x402_pay_to_testnet">Testnet receive address</label></th>
+                <td><input type="text" id="x402_pay_to_testnet" name="x402_pay_to_testnet" class="regular-text code" value="<?php echo esc_attr((string) get_option('x402_pay_to_testnet', (string) get_option('x402_pay_to', ''))); ?>" placeholder="0x…" /></td>
+            </tr>
+            <tr>
+                <th scope="row"><label for="x402_pay_to_mainnet">Mainnet receive address</label></th>
+                <td><input type="text" id="x402_pay_to_mainnet" name="x402_pay_to_mainnet" class="regular-text code" value="<?php echo esc_attr((string) get_option('x402_pay_to_mainnet', '')); ?>" placeholder="0x…" /></td>
+            </tr>
+            <tr>
+                <th scope="row"><label for="x402_cdp_key_id">CDP API key ID (mainnet)</label></th>
+                <td><input type="text" id="x402_cdp_key_id" name="x402_cdp_key_id" class="regular-text code" value="<?php echo esc_attr((string) get_option('x402_cdp_key_id', '')); ?>" placeholder="organizations/…/apiKeys/…" /></td>
+            </tr>
+            <tr>
+                <th scope="row"><label for="x402_cdp_secret_input">CDP API key secret (mainnet)</label></th>
+                <td>
+                    <input type="password" id="x402_cdp_secret_input" name="x402_cdp_secret_input" class="regular-text code" value="" placeholder="<?php echo $has_cdp ? '•••••• (stored — leave blank to keep)' : 'base64 Ed25519 secret'; ?>" autocomplete="off" />
+                    <p class="description">Stored encrypted at rest. From the <a href="https://portal.cdp.coinbase.com" target="_blank" rel="noopener">Coinbase Developer Platform</a> — free, this is what authenticates mainnet settlement (funds still go to your wallet, never Coinbase's).</p>
+                </td>
+            </tr>
+            <tr>
+                <th scope="row">Reverse proxy</th>
+                <td><label><input type="checkbox" name="x402_trust_proxy" value="1" <?php checked(get_option('x402_trust_proxy')); ?> /> This site is behind a trusted proxy/CDN that sets <code>X-Forwarded-For</code> (used for per-visitor rate limiting <strong>and redelivery grants</strong> — leave off unless a real proxy strips inbound XFF, or a spoofed header could win free re-delivery of another buyer's purchase)</label></td>
+            </tr>
+        </table>
+        <?php submit_button('Save'); ?>
+    </form>
+    <?php
+}
 
-        <h2 class="title">Knowledge index</h2>
-        <p><strong><?php echo (int) $chunk_stats['docs']; ?></strong> documents · <strong><?php echo (int) $chunk_stats['n']; ?></strong> searchable chunks</p>
-        <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" enctype="multipart/form-data" style="margin-bottom:8px">
-            <?php wp_nonce_field('x402_import_corpus'); ?>
-            <input type="hidden" name="action" value="x402_import_corpus" />
-            <input type="file" name="corpus_zip" accept=".zip" required />
-            <?php submit_button('Import corpus (zip of markdown)', 'secondary', 'submit', false); ?>
-            <p class="description">A vault of .md/.txt files. Files are sanitized on the way in (dotfiles, binaries, key material rejected; frontmatter stripped), stored <strong>privately</strong> — never rendered on your site — and sold only as answers through the ask endpoint. Host upload limit: <?php echo esc_html((string) ini_get('upload_max_filesize')); ?>.</p>
-        </form>
-        <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
-            <?php wp_nonce_field('x402_reindex'); ?>
-            <input type="hidden" name="action" value="x402_reindex" />
-            <?php submit_button('Reindex everything', 'secondary', 'submit', false); ?>
-        </form>
+function x402_tab_knowledge(): void
+{
+    global $wpdb;
+    $chunk_stats = $wpdb->get_row("SELECT COUNT(*) AS n, COUNT(DISTINCT CONCAT(source, source_id)) AS docs FROM {$wpdb->prefix}x402_chunks", ARRAY_A) ?: ['n' => 0, 'docs' => 0];
+    ?>
+    <p>Sell <strong>answers, not documents</strong>: agents <code>POST /x402/v1/ask</code>, pay per query, and get cited passages from your indexed content.</p>
+    <form method="post" action="options.php">
+        <?php settings_fields('x402_ask'); ?>
+        <table class="form-table" role="presentation">
+            <tr>
+                <th scope="row">Ask endpoint</th>
+                <td>
+                    <label><input type="checkbox" name="x402_ask_enabled" value="1" <?php checked(get_option('x402_ask_enabled')); ?> /> Enable the paid ask endpoint</label><br/>
+                    <label><input type="checkbox" name="x402_ask_index_posts" value="1" <?php checked(get_option('x402_ask_index_posts')); ?> /> Index published posts &amp; pages (run Reindex after changing)</label>
+                </td>
+            </tr>
+            <tr>
+                <th scope="row"><label for="x402_ask_price">Price per query</label></th>
+                <td><input type="text" id="x402_ask_price" name="x402_ask_price" class="small-text" value="<?php echo esc_attr((string) get_option('x402_ask_price', '$0.02')); ?>" /></td>
+            </tr>
+            <tr>
+                <th scope="row"><label for="x402_ask_description">Ask description (max 250 chars — facilitator limit)</label></th>
+                <td><input type="text" id="x402_ask_description" name="x402_ask_description" class="large-text" maxlength="250" value="<?php echo esc_attr((string) get_option('x402_ask_description', '')); ?>" placeholder="What can agents ask this site about?" /></td>
+            </tr>
+        </table>
+        <?php submit_button('Save'); ?>
+    </form>
 
-        <h2 class="title">Proxy products</h2>
-        <p>Sell any endpoint: buyers pay here, the request is forwarded to your upstream URL and the response is delivered. Upstream URLs are operator-entered only. <strong>Payment settles before the forward</strong> — if your upstream is down, the buyer is charged and gets a 502, so keep upstreams reliable.</p>
-        <?php if (x402_proxy_products()) : ?>
-            <table class="widefat striped" style="max-width:900px;margin-bottom:8px">
-                <thead><tr><th>SKU</th><th>Title</th><th>Price</th><th>Upstream</th><th>Sell URL</th><th></th></tr></thead>
-                <tbody>
-                <?php foreach (x402_proxy_products() as $p) : ?>
-                    <tr>
-                        <td><code><?php echo esc_html($p['sku']); ?></code></td>
-                        <td><?php echo esc_html($p['title']); ?></td>
-                        <td><?php echo esc_html($p['price']); ?></td>
-                        <td><code><?php echo esc_html($p['url']); ?></code></td>
-                        <td><code><?php echo esc_html(rest_url('x402/v1/p/' . $p['sku'])); ?></code></td>
-                        <td>
-                            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
-                                <?php wp_nonce_field('x402_proxy_delete'); ?>
-                                <input type="hidden" name="action" value="x402_proxy_delete" />
-                                <input type="hidden" name="sku" value="<?php echo esc_attr($p['sku']); ?>" />
-                                <?php submit_button('Remove', 'link-delete', 'submit', false); ?>
-                            </form>
-                        </td>
-                    </tr>
-                <?php endforeach; ?>
-                </tbody>
-            </table>
-        <?php endif; ?>
-        <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
-            <?php wp_nonce_field('x402_proxy_add'); ?>
-            <input type="hidden" name="action" value="x402_proxy_add" />
-            <input type="text" name="sku" placeholder="sku (a-z0-9-)" class="regular-text code" style="width:130px" required />
-            <input type="text" name="title" placeholder="Title" class="regular-text" style="width:180px" required />
-            <input type="text" name="price" placeholder="$0.05" class="small-text" required />
-            <input type="url" name="url" placeholder="https://upstream.example/endpoint" class="regular-text code" style="width:280px" required />
-            <?php submit_button('Add proxy product', 'secondary', 'submit', false); ?>
-        </form>
+    <h2 class="title">Index</h2>
+    <p><strong><?php echo (int) $chunk_stats['docs']; ?></strong> documents · <strong><?php echo (int) $chunk_stats['n']; ?></strong> searchable chunks</p>
+    <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" enctype="multipart/form-data" style="margin-bottom:8px">
+        <?php wp_nonce_field('x402_import_corpus'); ?>
+        <input type="hidden" name="action" value="x402_import_corpus" />
+        <input type="file" name="corpus_zip" accept=".zip" required />
+        <?php submit_button('Import corpus (zip of markdown)', 'secondary', 'submit', false); ?>
+        <p class="description">A vault of .md/.txt files. Files are sanitized on the way in (dotfiles, binaries, key material rejected; frontmatter stripped), stored <strong>privately</strong> — never rendered on your site — and sold only as answers through the ask endpoint. Host upload limit: <?php echo esc_html((string) ini_get('upload_max_filesize')); ?>.</p>
+    </form>
+    <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
+        <?php wp_nonce_field('x402_reindex'); ?>
+        <input type="hidden" name="action" value="x402_reindex" />
+        <?php submit_button('Reindex everything', 'secondary', 'submit', false); ?>
+    </form>
+    <?php
+}
 
-        <h2 class="title">Sell any post, page, or file</h2>
-        <p>Edit any post, page, or media item — the <strong>“Sell to AI agents (x402)”</strong> box in the sidebar adds a price and puts it behind the paywall. Drop <code>[x402_catalog]</code> on a page to list everything for sale (styled by your theme).</p>
+function x402_tab_endpoints(): void
+{
+    $is_mainnet = x402_active_network() === X402_MAINNET;
+    ?>
+    <h2 class="title">Sell any post, page, or file</h2>
+    <p>Edit any post, page, or media item — the <strong>“Sell to AI agents (x402)”</strong> box in the sidebar adds a price and puts it behind the paywall. Drop <code>[x402_catalog]</code> on a page to list everything for sale (styled by your theme).</p>
 
-        <h2 class="title">Your store endpoints</h2>
-        <?php if (x402_pay_to() === '') : ?>
-            <p><span class="dashicons dashicons-warning" style="color:#dba617"></span> Not selling yet — save a receive address for the active network above first.</p>
-        <?php elseif ($is_mainnet && !x402_mainnet_ready()) : ?>
-            <p><span class="dashicons dashicons-warning" style="color:#dba617"></span> Mainnet selected but CDP key ID/secret are missing — add them above to settle real payments.</p>
-        <?php else : ?>
-            <p><span class="dashicons dashicons-yes-alt" style="color:#00a32a"></span> Live on <?php echo $is_mainnet ? 'mainnet' : 'testnet'; ?>. Agents hitting these URLs get an HTTP 402 challenge and can pay in USDC:</p>
-        <?php endif; ?>
+    <h2 class="title">Your store endpoints</h2>
+    <?php if (x402_pay_to() === '') : ?>
+        <p><span class="dashicons dashicons-warning" style="color:#dba617"></span> Not selling yet — set a receive address in the <strong>Network</strong> tab first.</p>
+    <?php elseif ($is_mainnet && !x402_mainnet_ready()) : ?>
+        <p><span class="dashicons dashicons-warning" style="color:#dba617"></span> Mainnet selected but CDP key ID/secret are missing — add them in the <strong>Network</strong> tab to settle real payments.</p>
+    <?php else : ?>
+        <p><span class="dashicons dashicons-yes-alt" style="color:#00a32a"></span> Live on <?php echo $is_mainnet ? 'mainnet' : 'testnet'; ?>. Agents hitting these URLs get an HTTP 402 challenge and can pay in USDC:</p>
+    <?php endif; ?>
+    <table class="widefat striped" style="max-width:900px">
+        <thead><tr><th>What</th><th>URL</th></tr></thead>
+        <tbody>
+            <tr><td>Catalog (free, machine-readable)</td><td><code><?php echo esc_html(rest_url('x402/v1/catalog')); ?></code></td></tr>
+            <tr><td>Ask (POST, per query)<?php echo get_option('x402_ask_enabled') ? '' : ' — disabled'; ?></td><td><code><?php echo esc_html(rest_url('x402/v1/ask')); ?></code></td></tr>
+            <tr><td>Demo product — sample markdown, $0.01</td><td><code><?php echo esc_html(rest_url('x402/v1/demo')); ?></code></td></tr>
+        </tbody>
+    </table>
+    <?php
+}
+
+function x402_tab_sales(): void
+{
+    global $wpdb;
+    $table  = $wpdb->prefix . 'x402_settlements';
+    $sales  = $wpdb->get_results("SELECT tx_hash, payer, product_ref, amount_usdc_micro, network, created_at FROM $table ORDER BY id DESC LIMIT 20", ARRAY_A) ?: [];
+    $totals = $wpdb->get_row("SELECT COUNT(*) AS n, COALESCE(SUM(amount_usdc_micro),0) AS micro FROM $table", ARRAY_A) ?: ['n' => 0, 'micro' => 0];
+    $funnel = $wpdb->get_results("SELECT outcome, COUNT(*) AS n FROM {$wpdb->prefix}x402_requests GROUP BY outcome", OBJECT_K) ?: [];
+    $n402   = (int) ($funnel['unpaid_402']->n ?? 0);
+    $npaid  = (int) ($funnel['paid_200']->n ?? 0);
+    $conv   = ($n402 + $npaid) > 0 ? round(100 * $npaid / ($n402 + $npaid), 1) : 0.0;
+    ?>
+    <p><strong><?php echo (int) $totals['n']; ?></strong> settled · <strong>$<?php echo esc_html(number_format(((int) $totals['micro']) / 1_000_000, 2)); ?></strong> USDC total · funnel: <strong><?php echo $n402; ?></strong> saw the price, <strong><?php echo $npaid; ?></strong> paid (<strong><?php echo esc_html((string) $conv); ?>%</strong> conversion)</p>
+    <?php if ($sales) : ?>
         <table class="widefat striped" style="max-width:900px">
-            <thead><tr><th>What</th><th>URL</th></tr></thead>
+            <thead><tr><th>When (UTC)</th><th>Product</th><th>Amount</th><th>Payer</th><th>Transaction</th><th>Network</th></tr></thead>
             <tbody>
-                <tr><td>Catalog (free, machine-readable)</td><td><code><?php echo esc_html(rest_url('x402/v1/catalog')); ?></code></td></tr>
-                <tr><td>Ask (POST, per query)<?php echo get_option('x402_ask_enabled') ? '' : ' — disabled'; ?></td><td><code><?php echo esc_html(rest_url('x402/v1/ask')); ?></code></td></tr>
-                <tr><td>Demo product — sample markdown, $0.01</td><td><code><?php echo esc_html(rest_url('x402/v1/demo')); ?></code></td></tr>
+            <?php foreach ($sales as $s) : ?>
+                <tr>
+                    <td><?php echo esc_html($s['created_at']); ?></td>
+                    <td><?php echo esc_html($s['product_ref']); ?></td>
+                    <td>$<?php echo esc_html(number_format(((int) $s['amount_usdc_micro']) / 1_000_000, 2)); ?></td>
+                    <td><code><?php echo esc_html(substr($s['payer'], 0, 10)); ?>…</code></td>
+                    <td><code><?php echo esc_html(substr($s['tx_hash'], 0, 14)); ?>…</code></td>
+                    <td><?php echo esc_html($s['network']); ?></td>
+                </tr>
+            <?php endforeach; ?>
             </tbody>
         </table>
+    <?php else : ?>
+        <p class="description">No sales yet. The first settlement will appear here.</p>
+    <?php endif; ?>
+    <?php
+}
 
-        <h2 class="title">Sales</h2>
-        <p><strong><?php echo (int) $totals['n']; ?></strong> settled · <strong>$<?php echo esc_html(number_format(((int) $totals['micro']) / 1_000_000, 2)); ?></strong> USDC total · funnel: <strong><?php echo $n402; ?></strong> saw the price, <strong><?php echo $npaid; ?></strong> paid (<strong><?php echo esc_html((string) $conv); ?>%</strong> conversion)</p>
-        <?php if ($sales) : ?>
-            <table class="widefat striped" style="max-width:900px">
-                <thead><tr><th>When (UTC)</th><th>Product</th><th>Amount</th><th>Payer</th><th>Transaction</th><th>Network</th></tr></thead>
-                <tbody>
-                <?php foreach ($sales as $s) : ?>
-                    <tr>
-                        <td><?php echo esc_html($s['created_at']); ?></td>
-                        <td><?php echo esc_html($s['product_ref']); ?></td>
-                        <td>$<?php echo esc_html(number_format(((int) $s['amount_usdc_micro']) / 1_000_000, 2)); ?></td>
-                        <td><code><?php echo esc_html(substr($s['payer'], 0, 10)); ?>…</code></td>
-                        <td><code><?php echo esc_html(substr($s['tx_hash'], 0, 14)); ?>…</code></td>
-                        <td><?php echo esc_html($s['network']); ?></td>
-                    </tr>
-                <?php endforeach; ?>
-                </tbody>
-            </table>
-        <?php else : ?>
-            <p class="description">No sales yet. The first settlement will appear here.</p>
-        <?php endif; ?>
-    </div>
+function x402_tab_proxy(): void
+{
+    ?>
+    <p>Sell any endpoint: buyers pay here, the request is forwarded to your upstream URL and the response is delivered. Upstream URLs are operator-entered only. <strong>Payment settles before the forward</strong> — if your upstream is down, the buyer is charged and gets a 502, so keep upstreams reliable.</p>
+    <?php if (x402_proxy_products()) : ?>
+        <table class="widefat striped" style="max-width:900px;margin-bottom:8px">
+            <thead><tr><th>SKU</th><th>Title</th><th>Price</th><th>Upstream</th><th>Sell URL</th><th></th></tr></thead>
+            <tbody>
+            <?php foreach (x402_proxy_products() as $p) : ?>
+                <tr>
+                    <td><code><?php echo esc_html($p['sku']); ?></code></td>
+                    <td><?php echo esc_html($p['title']); ?></td>
+                    <td><?php echo esc_html($p['price']); ?></td>
+                    <td><code><?php echo esc_html($p['url']); ?></code></td>
+                    <td><code><?php echo esc_html(rest_url('x402/v1/p/' . $p['sku'])); ?></code></td>
+                    <td>
+                        <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
+                            <?php wp_nonce_field('x402_proxy_delete'); ?>
+                            <input type="hidden" name="action" value="x402_proxy_delete" />
+                            <input type="hidden" name="sku" value="<?php echo esc_attr($p['sku']); ?>" />
+                            <?php submit_button('Remove', 'link-delete', 'submit', false); ?>
+                        </form>
+                    </td>
+                </tr>
+            <?php endforeach; ?>
+            </tbody>
+        </table>
+    <?php endif; ?>
+    <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
+        <?php wp_nonce_field('x402_proxy_add'); ?>
+        <input type="hidden" name="action" value="x402_proxy_add" />
+        <input type="text" name="sku" placeholder="sku (a-z0-9-)" class="regular-text code" style="width:130px" required />
+        <input type="text" name="title" placeholder="Title" class="regular-text" style="width:180px" required />
+        <input type="text" name="price" placeholder="$0.05" class="small-text" required />
+        <input type="url" name="url" placeholder="https://upstream.example/endpoint" class="regular-text code" style="width:280px" required />
+        <?php submit_button('Add proxy product', 'secondary', 'submit', false); ?>
+    </form>
     <?php
 }

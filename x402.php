@@ -25,6 +25,7 @@ require_once __DIR__ . '/includes/class-search.php';
 require_once __DIR__ . '/includes/class-cdp-jwt.php';
 require_once __DIR__ . '/includes/class-crypto.php';
 require_once __DIR__ . '/includes/class-setup.php';
+require_once __DIR__ . '/includes/class-collections.php';
 require_once __DIR__ . '/includes/indexer.php';
 require_once __DIR__ . '/includes/products.php';
 require_once __DIR__ . '/includes/wizard.php';
@@ -39,10 +40,7 @@ use X402\Settlements;
 const X402_TESTNET_FACILITATOR = 'https://x402.org/facilitator';
 const X402_RESERVED_SKUS       = ['demo', 'ask', 'catalog'];
 
-register_activation_hook(__FILE__, function (): void {
-    delete_option('x402_db_version'); // force schema pass on next load
-    x402_upgrade_db();
-});
+register_activation_hook(__FILE__, 'x402_upgrade_db'); // idempotent: no-op once at current version
 
 /* ---------- products ---------- */
 
@@ -60,17 +58,102 @@ function x402_demo_product(): array
     ];
 }
 
-function x402_ask_product(): array
+/** Ask-product descriptor for one collection, or null if it isn't a valid priced collection. */
+function x402_ask_product(string $slug): ?array
 {
+    $c = x402_collection($slug);
+    if ($c === null) {
+        return null;
+    }
+    try {
+        $amount = Price::toMicro((string) $c['price']);
+    } catch (InvalidArgumentException) {
+        return null;
+    }
     return [
-        'sku'          => 'ask',
-        'url'          => rest_url('x402/v1/ask'),
-        'description'  => (string) get_option('x402_ask_description', 'Paid retrieval over this site\'s indexed content. POST {"query": "..."} and get cited passages.'),
+        'sku'          => 'ask:' . $slug,
+        'collection'   => $slug,
+        'title'        => (string) ($c['title'] ?? $slug),
+        'url'          => rest_url('x402/v1/ask/' . $slug),
+        'description'  => (string) $c['description'],
         'mime_type'    => 'application/json',
-        'amount_micro' => Price::toMicro((string) get_option('x402_ask_price', '$0.02')),
+        'amount_micro' => $amount,
+        'price'        => (string) $c['price'],
         'network'      => x402_active_network(),
         'pay_to'       => x402_pay_to(),
     ];
+}
+
+/** Enabled collections that have a valid price, as ask products. */
+function x402_enabled_ask_products(): array
+{
+    $out = [];
+    foreach (x402_collections() as $slug => $c) {
+        if (!empty($c['enabled']) && ($p = x402_ask_product((string) $slug))) {
+            $out[] = $p;
+        }
+    }
+    return $out;
+}
+
+/** Paid retrieval over one collection: validate, rate-limit, paywall, search WHERE collection = slug. */
+function x402_ask_collection(string $slug, WP_REST_Request $request)
+{
+    x402_no_store();
+    $product = x402_ask_product($slug);
+    if ($product === null || empty(x402_collection($slug)['enabled'])) {
+        return new WP_REST_Response(['error' => 'unknown or disabled collection'], 404);
+    }
+    if (!x402_rate_limit(x402_client_ip_hash(), 30, 60)) {
+        return new WP_REST_Response(['error' => 'rate limit exceeded'], 429);
+    }
+
+    $body  = $request->get_json_params();
+    $query = is_array($body) ? trim((string) ($body['query'] ?? '')) : '';
+    $top_k = is_array($body) ? min(10, max(1, (int) ($body['top_k'] ?? 5))) : 5;
+    if ($query === '' || mb_strlen($query) > 500) {
+        return new WP_REST_Response(['error' => 'body must be JSON {"query": "1..500 chars", "top_k"?: 1..10}'], 400);
+    }
+    $boolean = Search::boolean_query($query);
+    if ($boolean === '') {
+        return new WP_REST_Response(['error' => 'query has no searchable terms'], 400);
+    }
+
+    global $wpdb;
+    if ((int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$wpdb->prefix}x402_chunks WHERE collection = %s", $slug)) === 0) {
+        return new WP_REST_Response(['error' => 'nothing indexed in this collection yet'], 503);
+    }
+
+    return x402_paywall($product, $request, function (array $settled) use ($wpdb, $slug, $query, $boolean, $top_k) {
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT source, source_id, source_name, heading, content,
+                    MATCH(heading, content) AGAINST(%s IN BOOLEAN MODE) AS score
+             FROM {$wpdb->prefix}x402_chunks
+             WHERE collection = %s AND MATCH(heading, content) AGAINST(%s IN BOOLEAN MODE)
+             ORDER BY score DESC LIMIT %d",
+            $boolean,
+            $slug,
+            $boolean,
+            $top_k
+        ), ARRAY_A) ?: [];
+
+        $results = array_map(static function (array $r): array {
+            $cite = $r['source'] === 'post'
+                ? (get_permalink((int) $r['source_id']) ?: $r['source_name'])
+                : $r['source_name'];
+            return [
+                'excerpt' => mb_substr($r['content'], 0, 700),
+                'heading' => $r['heading'],
+                'source'  => $cite,
+                'score'   => round((float) $r['score'], 4),
+            ];
+        }, $rows);
+
+        $response = new WP_REST_Response(['collection' => $slug, 'query' => $query, 'count' => count($results), 'results' => $results], 200);
+        $response->header('PAYMENT-RESPONSE', Facilitator::receipt_header($settled));
+        $response->header('X-Content-Type-Options', 'nosniff');
+        return $response;
+    });
 }
 
 /** @return array<array{sku:string, title:string, price:string, url:string}> operator-entered only (SSRF: never user-influenced) */
@@ -255,11 +338,11 @@ add_action('rest_api_init', function (): void {
                 'sku' => 'demo', 'title' => 'Demo: sample markdown', 'price' => '$0.01',
                 'url' => rest_url('x402/v1/demo'), 'mimeType' => 'text/markdown', 'network' => $network,
             ]];
-            if (get_option('x402_ask_enabled')) {
+            foreach (x402_enabled_ask_products() as $p) {
                 $products[] = [
-                    'sku' => 'ask', 'title' => 'Ask this site (per query)', 'price' => (string) get_option('x402_ask_price', '$0.02'),
-                    'url' => rest_url('x402/v1/ask'), 'method' => 'POST', 'mimeType' => 'application/json', 'network' => $network,
-                    'description' => x402_ask_product()['description'],
+                    'sku' => $p['sku'], 'title' => $p['title'], 'price' => $p['price'],
+                    'url' => $p['url'], 'method' => 'POST', 'mimeType' => 'application/json', 'network' => $network,
+                    'description' => $p['description'],
                 ];
             }
             foreach (x402_all_item_products() as $p) {
@@ -296,65 +379,30 @@ add_action('rest_api_init', function (): void {
         },
     ]);
 
+    // Bare /ask serves the sole enabled collection (convenience); many → point at /ask/{slug}.
     register_rest_route('x402/v1', '/ask', [
         'methods'             => 'POST',
         'permission_callback' => '__return_true',
         'callback'            => function (WP_REST_Request $request) {
             x402_no_store();
-            if (!get_option('x402_ask_enabled')) {
-                return new WP_REST_Response(['error' => 'ask endpoint is not enabled'], 404);
+            $enabled = x402_enabled_ask_products();
+            if (count($enabled) === 1) {
+                return x402_ask_collection($enabled[0]['collection'], $request);
             }
-            if (!x402_rate_limit(x402_client_ip_hash(), 30, 60)) {
-                return new WP_REST_Response(['error' => 'rate limit exceeded'], 429);
+            if ($enabled === []) {
+                return new WP_REST_Response(['error' => 'no ask collections enabled'], 404);
             }
-
-            $body  = $request->get_json_params();
-            $query = is_array($body) ? trim((string) ($body['query'] ?? '')) : '';
-            $top_k = is_array($body) ? min(10, max(1, (int) ($body['top_k'] ?? 5))) : 5;
-            if ($query === '' || mb_strlen($query) > 500) {
-                return new WP_REST_Response(['error' => 'body must be JSON {"query": "1..500 chars", "top_k"?: 1..10}'], 400);
-            }
-            $boolean = Search::boolean_query($query);
-            if ($boolean === '') {
-                return new WP_REST_Response(['error' => 'query has no searchable terms'], 400);
-            }
-
-            global $wpdb;
-            $chunk_count = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}x402_chunks");
-            if ($chunk_count === 0) {
-                return new WP_REST_Response(['error' => 'nothing indexed yet'], 503);
-            }
-
-            return x402_paywall(x402_ask_product(), $request, function (array $settled) use ($wpdb, $query, $boolean, $top_k) {
-                $rows = $wpdb->get_results($wpdb->prepare(
-                    "SELECT source, source_id, source_name, heading, content,
-                            MATCH(heading, content) AGAINST(%s IN BOOLEAN MODE) AS score
-                     FROM {$wpdb->prefix}x402_chunks
-                     WHERE MATCH(heading, content) AGAINST(%s IN BOOLEAN MODE)
-                     ORDER BY score DESC LIMIT %d",
-                    $boolean,
-                    $boolean,
-                    $top_k
-                ), ARRAY_A) ?: [];
-
-                $results = array_map(static function (array $r): array {
-                    $cite = $r['source'] === 'post'
-                        ? (get_permalink((int) $r['source_id']) ?: $r['source_name'])
-                        : $r['source_name'];
-                    return [
-                        'excerpt' => mb_substr($r['content'], 0, 700),
-                        'heading' => $r['heading'],
-                        'source'  => $cite,
-                        'score'   => round((float) $r['score'], 4),
-                    ];
-                }, $rows);
-
-                $response = new WP_REST_Response(['query' => $query, 'count' => count($results), 'results' => $results], 200);
-                $response->header('PAYMENT-RESPONSE', Facilitator::receipt_header($settled));
-                $response->header('X-Content-Type-Options', 'nosniff');
-                return $response;
-            });
+            return new WP_REST_Response([
+                'error'       => 'multiple ask collections — POST to /x402/v1/ask/{collection}',
+                'collections' => array_map(fn ($p) => $p['collection'], $enabled),
+            ], 400);
         },
+    ]);
+
+    register_rest_route('x402/v1', '/ask/(?P<slug>[a-z0-9-]+)', [
+        'methods'             => 'POST',
+        'permission_callback' => '__return_true',
+        'callback'            => fn (WP_REST_Request $request) => x402_ask_collection((string) $request['slug'], $request),
     ]);
 
     register_rest_route('x402/v1', '/p/(?P<sku>[a-z0-9-]+)', [
@@ -488,8 +536,8 @@ function x402_browser_hint(array $product): WP_REST_Response
 
 add_shortcode('x402_catalog', function (): string {
     $items = [];
-    if (get_option('x402_ask_enabled')) {
-        $items[] = ['title' => 'Ask this site', 'price' => (string) get_option('x402_ask_price', '$0.02'), 'url' => rest_url('x402/v1/ask'), 'desc' => x402_ask_product()['description']];
+    foreach (x402_enabled_ask_products() as $p) {
+        $items[] = ['title' => $p['title'], 'price' => $p['price'], 'url' => $p['url'], 'desc' => $p['description']];
     }
     foreach (x402_all_item_products() as $p) {
         $items[] = ['title' => $p['title'], 'price' => $p['price'], 'url' => $p['url'], 'desc' => $p['description']];

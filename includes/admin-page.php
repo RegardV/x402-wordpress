@@ -45,27 +45,7 @@ add_action('admin_init', function (): void {
         },
     ]);
     register_setting('x402', 'x402_trust_proxy', ['type' => 'boolean', 'sanitize_callback' => 'rest_sanitize_boolean']);
-    // Ask settings live in their own group so the Knowledge tab's form and the
-    // Network tab's form never reset each other's checkboxes on save.
-    register_setting('x402_ask', 'x402_ask_enabled', ['type' => 'boolean', 'sanitize_callback' => 'rest_sanitize_boolean']);
-    register_setting('x402_ask', 'x402_ask_index_posts', ['type' => 'boolean', 'sanitize_callback' => 'rest_sanitize_boolean']);
-    register_setting('x402_ask', 'x402_ask_price', [
-        'type'              => 'string',
-        'sanitize_callback' => function ($value): string {
-            $value = trim((string) $value);
-            try {
-                Price::toMicro($value);
-                return $value;
-            } catch (InvalidArgumentException) {
-                add_settings_error('x402_ask_price', 'x402_ask_price', 'Invalid price — use e.g. $0.02');
-                return (string) get_option('x402_ask_price', '$0.02');
-            }
-        },
-    ]);
-    register_setting('x402_ask', 'x402_ask_description', [
-        'type'              => 'string',
-        'sanitize_callback' => fn ($v): string => mb_substr(sanitize_text_field((string) $v), 0, 250),
-    ]);
+    // Ask products are now managed as collections (admin_post handlers), not options.
 });
 
 add_action('admin_notices', function (): void {
@@ -93,20 +73,58 @@ add_action('admin_post_x402_import_corpus', function (): void {
     if (!current_user_can('manage_options') || !check_admin_referer('x402_import_corpus')) {
         wp_die('forbidden');
     }
-    $file = $_FILES['corpus_zip'] ?? null;
-    if (!$file || ($file['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) {
-        set_transient('x402_import_report', ['summary' => 'upload failed — check the file and your host\'s upload_max_filesize (' . ini_get('upload_max_filesize') . ')', 'rejected' => []], 300);
-        wp_safe_redirect(admin_url('admin.php?page=x402'));
+    // Collection this import/edit belongs to (a named ask product).
+    $slug = \X402\Collections::slug((string) ($_POST['collection'] ?? ''));
+    if ($slug === '' || in_array($slug, X402_RESERVED_SKUS, true)) {
+        set_transient('x402_import_report', ['summary' => 'collection needs a valid name (letters/numbers).', 'rejected' => []], 300);
+        wp_safe_redirect(admin_url('admin.php?page=x402&tab=knowledge'));
         exit;
     }
+    $price = trim((string) ($_POST['price'] ?? '$0.02'));
+    try {
+        Price::toMicro($price);
+    } catch (InvalidArgumentException) {
+        set_transient('x402_import_report', ['summary' => "invalid price for '$slug' — use e.g. \$0.02", 'rejected' => []], 300);
+        wp_safe_redirect(admin_url('admin.php?page=x402&tab=knowledge'));
+        exit;
+    }
+    $existing = x402_collection($slug) ?? [];
+    x402_save_collection($slug, [
+        'title'       => sanitize_text_field((string) ($_POST['title'] ?? $slug)) ?: $slug,
+        'description' => mb_substr(sanitize_text_field((string) ($_POST['description'] ?? ($existing['description'] ?? ''))), 0, 250),
+        'price'       => $price,
+        'enabled'     => !empty($_POST['enabled']),
+        'kind'        => $existing['kind'] ?? 'corpus',
+    ]);
 
-    set_transient('x402_import_report', x402_import_zip($file['tmp_name']), 300);
-    wp_safe_redirect(admin_url('admin.php?page=x402'));
+    // A zip is optional — this form also just edits a collection's ask/price.
+    $file = $_FILES['corpus_zip'] ?? null;
+    if ($file && ($file['error'] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_OK) {
+        set_transient('x402_import_report', x402_import_zip($file['tmp_name'], $slug), 300);
+    } elseif ($file && ($file['error'] ?? 0) !== UPLOAD_ERR_NO_FILE) {
+        set_transient('x402_import_report', ['summary' => "collection '$slug' saved, but upload failed — check upload_max_filesize (" . ini_get('upload_max_filesize') . ')', 'rejected' => []], 300);
+    } else {
+        set_transient('x402_import_report', ['summary' => "collection '$slug' saved.", 'rejected' => []], 300);
+    }
+    wp_safe_redirect(admin_url('admin.php?page=x402&tab=knowledge'));
+    exit;
+});
+
+add_action('admin_post_x402_delete_collection', function (): void {
+    if (!current_user_can('manage_options') || !check_admin_referer('x402_delete_collection')) {
+        wp_die('forbidden');
+    }
+    $slug = \X402\Collections::slug((string) ($_POST['collection'] ?? ''));
+    if ($slug !== '') {
+        x402_delete_collection($slug);
+        set_transient('x402_import_report', ['summary' => "collection '$slug' deleted (its chunks and files removed).", 'rejected' => []], 300);
+    }
+    wp_safe_redirect(admin_url('admin.php?page=x402&tab=knowledge'));
     exit;
 });
 
 /** @return array{summary:string, rejected:string[]} */
-function x402_import_zip(string $zip_path): array
+function x402_import_zip(string $zip_path, string $collection): array
 {
     $zip = new ZipArchive();
     if ($zip->open($zip_path) !== true) {
@@ -147,7 +165,8 @@ function x402_import_zip(string $zip_path): array
             $rejected[] = "$name — binary or key material";
             continue;
         }
-        $existing = get_posts(['post_type' => 'x402_corpus', 'post_status' => 'private', 'title' => $name, 'numberposts' => 1, 'fields' => 'ids']);
+        // Dedup within this collection only — two collections may share a filename.
+        $existing = get_posts(['post_type' => 'x402_corpus', 'post_status' => 'private', 'title' => $name, 'numberposts' => 1, 'fields' => 'ids', 'meta_key' => '_x402_collection', 'meta_value' => $collection]);
         $post_id  = $existing
             ? (wp_update_post(['ID' => $existing[0], 'post_content' => $clean]) ?: 0)
             : (int) wp_insert_post(['post_type' => 'x402_corpus', 'post_status' => 'private', 'post_title' => $name, 'post_content' => $clean]);
@@ -155,7 +174,8 @@ function x402_import_zip(string $zip_path): array
             $rejected[] = "$name — could not store";
             continue;
         }
-        $chunks += x402_index_content('corpus', $post_id, $name, $clean);
+        update_post_meta($post_id, '_x402_collection', $collection);
+        $chunks += x402_index_content($collection, 'corpus', $post_id, $name, $clean);
         $accepted++;
     }
     $zip->close();
@@ -314,41 +334,78 @@ function x402_tab_network(): void
 
 function x402_tab_knowledge(): void
 {
-    global $wpdb;
-    $chunk_stats = $wpdb->get_row("SELECT COUNT(*) AS n, COUNT(DISTINCT CONCAT(source, source_id)) AS docs FROM {$wpdb->prefix}x402_chunks", ARRAY_A) ?: ['n' => 0, 'docs' => 0];
+    $collections = x402_collections();
+    $stats       = x402_collection_stats();
     ?>
-    <p>Sell <strong>answers, not documents</strong>: agents <code>POST /x402/v1/ask</code>, pay per query, and get cited passages from your indexed content.</p>
-    <form method="post" action="options.php">
-        <?php settings_fields('x402_ask'); ?>
-        <table class="form-table" role="presentation">
-            <tr>
-                <th scope="row">Ask endpoint</th>
-                <td>
-                    <label><input type="checkbox" name="x402_ask_enabled" value="1" <?php checked(get_option('x402_ask_enabled')); ?> /> Enable the paid ask endpoint</label><br/>
-                    <label><input type="checkbox" name="x402_ask_index_posts" value="1" <?php checked(get_option('x402_ask_index_posts')); ?> /> Index published posts &amp; pages (run Reindex after changing)</label>
-                </td>
-            </tr>
-            <tr>
-                <th scope="row"><label for="x402_ask_price">Price per query</label></th>
-                <td><input type="text" id="x402_ask_price" name="x402_ask_price" class="small-text" value="<?php echo esc_attr((string) get_option('x402_ask_price', '$0.02')); ?>" /></td>
-            </tr>
-            <tr>
-                <th scope="row"><label for="x402_ask_description">Ask description (max 250 chars — facilitator limit)</label></th>
-                <td><input type="text" id="x402_ask_description" name="x402_ask_description" class="large-text" maxlength="250" value="<?php echo esc_attr((string) get_option('x402_ask_description', '')); ?>" placeholder="What can agents ask this site about?" /></td>
-            </tr>
-        </table>
-        <?php submit_button('Save'); ?>
-    </form>
+    <p>Sell <strong>answers, not documents</strong>: each <em>collection</em> is its own ask product — a body of knowledge with its own pitch, price, and endpoint (<code>POST /x402/v1/ask/{slug}</code>). Import a vault to create one; agents pay per query and get cited passages.</p>
 
-    <h2 class="title">Index</h2>
-    <p><strong><?php echo (int) $chunk_stats['docs']; ?></strong> documents · <strong><?php echo (int) $chunk_stats['n']; ?></strong> searchable chunks</p>
-    <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" enctype="multipart/form-data" style="margin-bottom:8px">
+    <h2 class="title">Collections</h2>
+    <?php if ($collections) : ?>
+        <table class="widefat striped" style="max-width:960px;margin-bottom:12px">
+            <thead><tr><th>Slug</th><th>Title</th><th>Ask description</th><th>Price</th><th>Docs / chunks</th><th>Live</th><th>Endpoint</th><th></th></tr></thead>
+            <tbody>
+            <?php foreach ($collections as $slug => $c) :
+                $s = $stats[$slug] ?? ['docs' => 0, 'chunks' => 0]; ?>
+                <tr>
+                    <td><code><?php echo esc_html((string) $slug); ?></code></td>
+                    <td><?php echo esc_html((string) ($c['title'] ?? $slug)); ?><?php echo ($c['kind'] ?? '') === 'posts' ? ' <span class="description">(site posts)</span>' : ''; ?></td>
+                    <td style="max-width:280px"><?php echo esc_html((string) ($c['description'] ?? '')); ?></td>
+                    <td><?php echo esc_html((string) ($c['price'] ?? '')); ?></td>
+                    <td><?php echo (int) $s['docs']; ?> / <?php echo (int) $s['chunks']; ?></td>
+                    <td><?php echo !empty($c['enabled']) ? '<span class="dashicons dashicons-yes-alt" style="color:#00a32a"></span>' : '—'; ?></td>
+                    <td><code><?php echo esc_html(rest_url('x402/v1/ask/' . $slug)); ?></code></td>
+                    <td>
+                        <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" onsubmit="return confirm('Delete collection &quot;<?php echo esc_js((string) $slug); ?>&quot; and all its indexed content?');">
+                            <?php wp_nonce_field('x402_delete_collection'); ?>
+                            <input type="hidden" name="action" value="x402_delete_collection" />
+                            <input type="hidden" name="collection" value="<?php echo esc_attr((string) $slug); ?>" />
+                            <?php submit_button('Delete', 'link-delete', 'submit', false); ?>
+                        </form>
+                    </td>
+                </tr>
+            <?php endforeach; ?>
+            </tbody>
+        </table>
+        <p class="description">This table is exactly what the <a href="<?php echo esc_url(rest_url('x402/v1/catalog')); ?>"><code>/catalog</code></a> endpoint advertises (enabled rows).</p>
+    <?php else : ?>
+        <p class="description">No collections yet. Import a vault below to create your first ask product.</p>
+    <?php endif; ?>
+
+    <h2 class="title">Import / update a collection</h2>
+    <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" enctype="multipart/form-data">
         <?php wp_nonce_field('x402_import_corpus'); ?>
         <input type="hidden" name="action" value="x402_import_corpus" />
-        <input type="file" name="corpus_zip" accept=".zip" required />
-        <?php submit_button('Import corpus (zip of markdown)', 'secondary', 'submit', false); ?>
-        <p class="description">A vault of .md/.txt files. Files are sanitized on the way in (dotfiles, binaries, key material rejected; frontmatter stripped), stored <strong>privately</strong> — never rendered on your site — and sold only as answers through the ask endpoint. Host upload limit: <?php echo esc_html((string) ini_get('upload_max_filesize')); ?>.</p>
+        <table class="form-table" role="presentation">
+            <tr>
+                <th scope="row"><label for="x402_col_name">Collection name</label></th>
+                <td><input type="text" id="x402_col_name" name="collection" class="regular-text" placeholder="Kubernetes vault" required />
+                    <p class="description">Becomes the URL slug. Re-using an existing slug <strong>replaces</strong> that collection's files (a fresh ingest).</p></td>
+            </tr>
+            <tr>
+                <th scope="row"><label for="x402_col_title">Display title</label></th>
+                <td><input type="text" id="x402_col_title" name="title" class="regular-text" placeholder="Ask my Kubernetes vault" /></td>
+            </tr>
+            <tr>
+                <th scope="row"><label for="x402_col_desc">Ask description (max 250)</label></th>
+                <td><input type="text" id="x402_col_desc" name="description" class="large-text" maxlength="250" placeholder="What can agents ask this collection about?" /></td>
+            </tr>
+            <tr>
+                <th scope="row"><label for="x402_col_price">Price per query</label></th>
+                <td><input type="text" id="x402_col_price" name="price" class="small-text" value="$0.02" /></td>
+            </tr>
+            <tr>
+                <th scope="row">Live</th>
+                <td><label><input type="checkbox" name="enabled" value="1" checked /> Sell this collection (list it in the catalog)</label></td>
+            </tr>
+            <tr>
+                <th scope="row"><label for="x402_col_zip">Corpus zip</label></th>
+                <td><input type="file" id="x402_col_zip" name="corpus_zip" accept=".zip" />
+                    <p class="description">.md/.txt files, sanitized on import (dotfiles, binaries, key material rejected; frontmatter stripped) and stored <strong>privately</strong>. Optional — leave blank to only edit the pitch/price of an existing collection. Host upload limit: <?php echo esc_html((string) ini_get('upload_max_filesize')); ?>.</p></td>
+            </tr>
+        </table>
+        <?php submit_button('Import / save collection'); ?>
     </form>
+
     <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
         <?php wp_nonce_field('x402_reindex'); ?>
         <input type="hidden" name="action" value="x402_reindex" />
@@ -372,14 +429,23 @@ function x402_tab_endpoints(): void
     <?php else : ?>
         <p><span class="dashicons dashicons-yes-alt" style="color:#00a32a"></span> Live on <?php echo $is_mainnet ? 'mainnet' : 'testnet'; ?>. Agents hitting these URLs get an HTTP 402 challenge and can pay in USDC:</p>
     <?php endif; ?>
-    <table class="widefat striped" style="max-width:900px">
-        <thead><tr><th>What</th><th>URL</th></tr></thead>
+    <table class="widefat striped" style="max-width:960px">
+        <thead><tr><th>Type</th><th>What</th><th>Price</th><th>URL</th></tr></thead>
         <tbody>
-            <tr><td>Catalog (free, machine-readable)</td><td><code><?php echo esc_html(rest_url('x402/v1/catalog')); ?></code></td></tr>
-            <tr><td>Ask (POST, per query)<?php echo get_option('x402_ask_enabled') ? '' : ' — disabled'; ?></td><td><code><?php echo esc_html(rest_url('x402/v1/ask')); ?></code></td></tr>
-            <tr><td>Demo product — sample markdown, $0.01</td><td><code><?php echo esc_html(rest_url('x402/v1/demo')); ?></code></td></tr>
+            <tr><td>catalog</td><td>Machine-readable product list (free)</td><td>—</td><td><code><?php echo esc_html(rest_url('x402/v1/catalog')); ?></code></td></tr>
+            <tr><td>demo</td><td>Demo: sample markdown</td><td>$0.01</td><td><code><?php echo esc_html(rest_url('x402/v1/demo')); ?></code></td></tr>
+            <?php foreach (x402_enabled_ask_products() as $p) : ?>
+                <tr><td>ask</td><td><?php echo esc_html($p['title']); ?></td><td><?php echo esc_html($p['price']); ?></td><td><code><?php echo esc_html($p['url']); ?></code></td></tr>
+            <?php endforeach; ?>
+            <?php foreach (x402_all_item_products() as $p) : ?>
+                <tr><td>item</td><td><?php echo esc_html($p['title']); ?></td><td><?php echo esc_html($p['price']); ?></td><td><code><?php echo esc_html($p['url']); ?></code></td></tr>
+            <?php endforeach; ?>
+            <?php foreach (x402_proxy_products() as $p) : ?>
+                <tr><td>proxy</td><td><?php echo esc_html($p['title']); ?></td><td><?php echo esc_html($p['price']); ?></td><td><code><?php echo esc_html(rest_url('x402/v1/p/' . $p['sku'])); ?></code></td></tr>
+            <?php endforeach; ?>
         </tbody>
     </table>
+    <p class="description">This is your full public surface — the same set the <a href="<?php echo esc_url(rest_url('x402/v1/catalog')); ?>"><code>/catalog</code></a> endpoint returns to agents.</p>
     <?php
 }
 

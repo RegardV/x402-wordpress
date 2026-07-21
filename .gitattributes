@@ -1,0 +1,13 @@
+# Files excluded from the distributable plugin zip built with:
+#   git archive --prefix=x402/ -o x402-<version>.zip HEAD
+# Runtime needs no composer install (zero runtime dependencies), so vendor/ and
+# the composer files are dev-only here.
+/.gitattributes   export-ignore
+/.gitignore       export-ignore
+/.wp-env.json     export-ignore
+/BUILDLOG.md      export-ignore
+/composer.json    export-ignore
+/composer.lock    export-ignore
+/docker-compose.yml export-ignore
+/phpunit.xml      export-ignore
+/tests            export-ignore

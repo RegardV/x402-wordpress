@@ -40,6 +40,25 @@ Everything below is settled on-chain against this code by an independent x402 cl
 
 Roadmap (spec'd): Tier 3 — wordpress.org submission, Bazaar discoverability, demand pricing. WooCommerce bridge and human checkout are deliberate non-goals for the MVP.
 
+## Install
+
+Download **[the latest release zip](https://github.com/RegardV/x402-wordpress/releases/latest)**,
+then in wp-admin: **Plugins → Add New → Upload Plugin → Choose File → Install Now → Activate**.
+
+Requires PHP 8.0+. No `composer install`, no build step — zero runtime dependencies.
+
+<details>
+<summary>Install from source instead</summary>
+
+```bash
+git clone https://github.com/RegardV/x402-wordpress.git
+cd x402-wordpress
+git archive --prefix=x402/ -o x402.zip HEAD   # dev files stripped via .gitattributes
+```
+
+Upload `x402.zip` as above, or drop the contents into `wp-content/plugins/x402/`.
+</details>
+
 ## Try it
 
 On any WordPress: install + activate, then open the **x402** menu in wp-admin — set your receive wallet address there, and the page shows your live store endpoints and every settled sale. That's the whole setup.
